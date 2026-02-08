@@ -45,14 +45,14 @@ class CompositionState:
     def to_context(self) -> str:
         """Convert composition state to text for GPT."""
         if not self.tracks:
-            return "当前没有任何音轨。"
+            return "There are no tracks yet."
 
-        context = f"当前作品包含 {len(self.tracks)} 个音轨：\n"
+        context = f"The current composition has {len(self.tracks)} track(s):\n"
         for track in self.tracks:
             context += f"- {track.to_summary()}\n"
 
         if self.metadata:
-            context += f"\n全局信息: {json.dumps(self.metadata, ensure_ascii=False)}"
+            context += f"\nGlobal metadata: {json.dumps(self.metadata, ensure_ascii=False)}"
 
         return context
 
@@ -75,60 +75,59 @@ class ConductorResponse:
 
 
 # System prompt for GPT-4o Conductor
-CONDUCTOR_SYSTEM_PROMPT = """你是一位专业的音乐制作人和编曲大师。你的角色是理解用户的音乐创作意图，分析已生成的音乐，并规划如何改进或扩展作品。
+CONDUCTOR_SYSTEM_PROMPT = """You are a professional music producer and arranger. Your role is to understand the user's musical intent, analyze the generated music, and plan how to improve or expand the composition.
 
-**你的能力范围：**
-- 理解音乐术语、风格、情绪、编曲
-- 分析 MIDI 音乐特征数据（音符密度、音高分布、乐器等）
-- 规划音乐创作步骤（创建新音轨、修改现有音轨）
-- 用自然、专业的中文与用户交流
+You must communicate in English only.
 
-**你不负责：**
-- 生成具体的 MIDI 音符（这由 MIDI-LLM 完成）
-- 音频信号处理
-- 记忆完整对话历史（每次只关注当前状态）
+**What you can do:**
+- Understand musical terms, styles, moods, and arrangement
+- Analyze MIDI feature data (note density, pitch distribution, instruments, etc.)
+- Plan creative steps (create new tracks, modify existing ones)
 
-**音乐特征数据说明：**
-- `note_density`: 音符密度（notes/sec），越高越密集
-- `pitch_range`: 音高范围（MIDI 编号，60=中央C）
-- `instruments_used`: 使用的乐器（GM program numbers）
-- `duration_seconds`: 时长（秒）
-- `onset_density_curve`: 活跃度曲线（每个时间窗口的音符数）
+**What you do NOT do:**
+- Generate MIDI notes directly (the MIDI-LLM does that)
+- Perform audio signal processing
+- Remember full conversation history (only current state is provided)
 
-**输出格式要求：**
-你必须以 JSON 格式输出，包含：
+**MIDI feature schema:**
+- `note_density`: notes/sec (higher means denser)
+- `pitch_range`: MIDI pitch range (60 = middle C)
+- `instruments_used`: GM program numbers
+- `duration_seconds`: duration in seconds
+- `onset_density_curve`: notes per time window
+
+**Required output format (JSON only):**
 ```json
 {
-  "message": "用户可见的自然语言回复（中文）",
+  "message": "Natural language reply to the user (English)",
   "actions": [
     {
       "type": "create_track | regenerate_track | modify_track | delete_track",
       "parameters": {
-        "track_id": "仅修改/删除时需要",
-        "instrument": "Piano | Drums | Bass | Strings | Guitar 等",
+        "track_id": "required for modify/delete",
+        "instrument": "Piano | Drums | Bass | Strings | Guitar ...",
         "role": "melody | harmony | rhythm | bass",
-        "instruction": "给 MIDI-LLM 的详细英文指令，描述音乐风格、节奏、情绪等"
+        "instruction": "Detailed English prompt for the MIDI-LLM (style, tempo, feel, key, texture)"
       }
     }
   ],
-  "reasoning": "你的内部推理过程（可选，用于调试）"
+  "reasoning": "Optional internal reasoning for debugging"
 }
 ```
 
-**关键原则：**
-1. **用户体验至上**：用自然、友好的中文交流，避免技术术语堆砌
-2. **音乐专业性**：基于音乐理论做出合理的编曲决策
-3. **渐进式创作**：一次添加/修改少量音轨，让用户逐步参与
-4. **特征驱动**：根据 MIDI 特征数据（而非主观猜测）分析音乐
-5. **明确指令**：给 MIDI-LLM 的 instruction 要具体（调性、速度、织体等）
+**Guiding principles:**
+1. Prioritize user experience with clear, friendly English.
+2. Make musically sound decisions grounded in theory.
+3. Use gradual iteration: add or change a small number of tracks per turn.
+4. Be feature-driven: reference MIDI features, not vague guesses.
+5. Provide precise instructions to the MIDI-LLM.
 
-**示例对话：**
-
-用户："我想要一段平静的钢琴曲"
-你的输出：
+**Example:**
+User: "I want a calm piano piece"
+Output:
 ```json
 {
-  "message": "好的，我来为你创作一段平静的钢琴旋律。我会使用舒缓的节奏和中等音域，营造宁静的氛围。",
+  "message": "Great—I'll create a calm piano melody with a gentle pace and a warm middle register.",
   "actions": [{
     "type": "create_track",
     "parameters": {
@@ -140,25 +139,7 @@ CONDUCTOR_SYSTEM_PROMPT = """你是一位专业的音乐制作人和编曲大师
 }
 ```
 
-用户："钢琴太单调了，加点弦乐"
-（假设当前有 1 个钢琴音轨，note_density=5.2）
-你的输出：
-```json
-{
-  "message": "我会添加一段柔和的弦乐铺底，与钢琴形成和声层次，让音乐更饱满。",
-  "actions": [{
-    "type": "create_track",
-    "parameters": {
-      "instrument": "Strings",
-      "role": "harmony",
-      "instruction": "String pad in C major, slow sustained notes, long whole notes and half notes, lower register than piano, supporting harmonies, soft and warm"
-    }
-  }],
-  "reasoning": "钢琴密度 5.2 notes/sec 已经较低，弦乐应该更稀疏，用长音符做和声铺垫"
-}
-```
-
-现在，请根据用户的消息和当前作品状态，输出你的回复和行动计划。"""
+Now, based on the user's message and the current composition state, output your reply and action plan as JSON."""
 
 
 class GPTConductor:
@@ -188,14 +169,14 @@ class GPTConductor:
             ConductorResponse with message + actions
         """
         # Build user message with context
-        context = composition_state.to_context() if composition_state else "当前没有任何音轨。"
+        context = composition_state.to_context() if composition_state else "There are no tracks yet."
 
-        user_prompt = f"""用户消息：{user_message}
+        user_prompt = f"""User message: {user_message}
 
-当前作品状态：
+Current composition state:
 {context}
 
-请分析用户意图和当前状态，输出你的回复和行动计划（JSON格式）。"""
+Analyze the user's intent and the current state, then output your reply and action plan as JSON."""
 
         # Call GPT-4o
         try:
@@ -234,7 +215,7 @@ class GPTConductor:
         except json.JSONDecodeError as e:
             # Fallback if GPT doesn't return valid JSON
             return ConductorResponse(
-                message=f"抱歉，我在理解你的请求时遇到了问题：{e}",
+                message=f"Sorry, I had trouble understanding your request: {e}",
                 actions=[],
             )
 

@@ -92,6 +92,7 @@ class TrackManager:
     def add_track(
         self,
         composition_id: str,
+        track_id: Optional[str],
         instrument: str,
         role: str,
         midi_path: str,
@@ -103,6 +104,7 @@ class TrackManager:
 
         Args:
             composition_id: Composition ID
+            track_id: Optional track ID (auto-generated if None)
             instrument: Instrument name
             role: Track role (melody, harmony, rhythm, bass)
             midi_path: Path to MIDI file
@@ -120,8 +122,9 @@ class TrackManager:
         if not session:
             raise ValueError(f"Composition {composition_id} not found")
 
-        # Generate track ID
-        track_id = f"track_{len(session.state.tracks) + 1}"
+        # Generate track ID if not provided
+        if not track_id:
+            track_id = f"track_{len(session.state.tracks) + 1}"
 
         # Create track
         track = Track(
@@ -134,6 +137,8 @@ class TrackManager:
             metadata=metadata or {},
         )
 
+        track.metadata.setdefault("version", 1)
+
         # Add to composition
         session.state.tracks.append(track)
 
@@ -143,6 +148,40 @@ class TrackManager:
         session.updated_at = datetime.utcnow().isoformat()
 
         return track_id
+
+    def update_track(
+        self,
+        composition_id: str,
+        track_id: str,
+        instrument: Optional[str],
+        role: Optional[str],
+        midi_path: str,
+        audio_path: str,
+        features: MusicFeatures,
+        metadata: Optional[dict] = None,
+    ) -> bool:
+        """Update an existing track with new media and features."""
+        session = self.get_session(composition_id)
+        if not session:
+            return False
+
+        for track in session.state.tracks:
+            if track.id == track_id:
+                if instrument:
+                    track.instrument = instrument
+                if role:
+                    track.role = role
+                track.midi_path = midi_path
+                track.audio_path = audio_path
+                track.features = features
+                if metadata:
+                    track.metadata.update(metadata)
+                track.metadata["version"] = track.metadata.get("version", 1) + 1
+                from datetime import datetime
+
+                session.updated_at = datetime.utcnow().isoformat()
+                return True
+        return False
 
     def remove_track(self, composition_id: str, track_id: str) -> bool:
         """Remove a track from composition.

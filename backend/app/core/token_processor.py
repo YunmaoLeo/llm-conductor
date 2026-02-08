@@ -39,6 +39,16 @@ class ProcessedGeneration:
     audio_path: Optional[str] = None
 
 
+@dataclass
+class MidiConversionResult:
+    """Lightweight MIDI conversion result for chat pipeline."""
+
+    midi_bytes: bytes
+    pretty_midi: "pretty_midi.PrettyMIDI"
+    num_notes: int
+    duration_seconds: float
+
+
 def validate_tokens(token_ids: list[int], max_notes_per_time: int = 64) -> tuple[bool, str]:
     """Validate a MIDI token sequence.
 
@@ -76,6 +86,30 @@ def validate_tokens(token_ids: list[int], max_notes_per_time: int = 64) -> tuple
         return False, f"Excessive simultaneous notes: {max_count} at one time point"
 
     return True, "Valid"
+
+
+def prune_excessive_notes(
+    token_ids: list[int], max_notes_per_time: int = 64
+) -> list[int]:
+    """Prune notes so no time point exceeds max_notes_per_time.
+
+    Keeps the earliest notes at each time point and drops the rest.
+    """
+    if not token_ids:
+        return token_ids
+
+    usable = len(token_ids) - (len(token_ids) % 3)
+    pruned: list[int] = []
+    time_counts: dict[int, int] = {}
+
+    for i in range(0, usable, 3):
+        t = token_ids[i]
+        count = time_counts.get(t, 0)
+        if count < max_notes_per_time:
+            pruned.extend([token_ids[i], token_ids[i + 1], token_ids[i + 2]])
+            time_counts[t] = count + 1
+
+    return pruned
 
 
 def parse_note_events(token_ids: list[int]) -> list[NoteEvent]:
@@ -132,6 +166,13 @@ class TokenProcessor:
         if validate:
             is_valid, message = validate_tokens(token_ids)
             if not is_valid:
+                # Auto-prune excessive notes and re-validate
+                if message.startswith("Excessive simultaneous notes"):
+                    token_ids = prune_excessive_notes(token_ids)
+                    is_valid, message = validate_tokens(token_ids)
+                    if is_valid:
+                        return self.process(token_ids, validate=False)
+
                 return ProcessedGeneration(
                     id=gen_id,
                     token_ids=token_ids,
@@ -202,3 +243,23 @@ class TokenProcessor:
         # mido.MidiFile.save() accepts a file object
         midi_obj.save(file=buf)
         return buf.getvalue()
+
+    def tokens_to_midi(self, token_ids: list[int]) -> MidiConversionResult:
+        """Convert MIDI token IDs directly to MIDI bytes + PrettyMIDI.
+
+        Raises:
+            ValueError: If token processing fails.
+        """
+        processed = self.process(token_ids, validate=True)
+        if not processed.is_valid or not processed.midi_bytes:
+            raise ValueError(processed.validation_message)
+
+        import pretty_midi
+
+        pm = pretty_midi.PrettyMIDI(io.BytesIO(processed.midi_bytes))
+        return MidiConversionResult(
+            midi_bytes=processed.midi_bytes,
+            pretty_midi=pm,
+            num_notes=processed.num_notes,
+            duration_seconds=processed.duration_seconds,
+        )

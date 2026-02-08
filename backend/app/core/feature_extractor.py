@@ -153,12 +153,18 @@ def extract_features(
         midi_bytes = midi_buffer.getvalue()
 
         # Create temporary ProcessedGeneration
+        instruments = sorted({int(inst.program) for inst in source.instruments if not inst.is_drum})
+        num_notes = sum(len(inst.notes) for inst in source.instruments)
         temp_gen = ProcessedGeneration(
-            midi_token_ids=[],
+            id="temp",
+            token_ids=[],
+            note_events=[],
             midi_bytes=midi_bytes,
-            pretty_midi=source,
+            num_notes=num_notes,
+            duration_seconds=source.get_end_time(),
+            instruments_used=instruments,
             is_valid=True,
-            note_count=sum(len(inst.notes) for inst in source.instruments),
+            validation_message="Valid",
         )
         return extractor.extract(temp_gen)
 

@@ -10,10 +10,12 @@ services:
       - ./utils:/utils
       - ./outputs:/outputs
       - ./.env:/app/.env
+      - ./soundfonts:/app/soundfonts
     environment:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - OLLAMA_MODEL=midi-llm-q6
       - OUTPUT_DIR=/outputs
+      - SOUNDFONT_PATH=/app/soundfonts/FluidR3_GM.sf2
       - PYTHONPATH=/app:/
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -117,6 +117,10 @@ http://localhost:5173  # Frontend
 http://localhost:8000  # Backend API
 ```
 
+### Notes
+- Keep the default dev workflow above. Use Docker Compose for the backend and local Vite for the frontend.
+- The Python virtualenv is only needed for running unit tests locally, not for normal development.
+
 ### API Endpoints
 
 **Chat (new system)**
