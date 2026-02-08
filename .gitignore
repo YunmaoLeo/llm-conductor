@@ -1,2 +1,30 @@
-docs/
+# OS
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+*.egg
+
+# Node
+node_modules/
+dist/
+
+# Generated outputs
+outputs/
+*.mid
+*.wav
+*.mp3
+
+# SoundFonts (large binary files)
+soundfonts/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.local

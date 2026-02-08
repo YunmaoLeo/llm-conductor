@@ -1,0 +1,38 @@
+[project]
+name = "llm-conductor"
+version = "0.1.0"
+description = "Agent-based Symbolic Music Orchestration System"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "httpx>=0.28",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "openai>=1.0",
+    "anticipation @ git+https://github.com/jthickstun/anticipation.git",
+    "pretty-midi",
+    "numpy",
+    "midi2audio",
+    "librosa",
+    "soundfile",
+    "pyloudnorm",
+    "websockets",
+    "python-multipart",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-httpx",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["app/tests"]
