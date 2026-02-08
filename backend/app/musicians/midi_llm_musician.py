@@ -106,6 +106,87 @@ class MIDILLMMusician:
             raw_response=response_text,
         )
 
+    async def generate_with_prefix(
+        self,
+        instruction: str,
+        prefix_tokens: list[int],
+        prefix_ratio: float = 0.3,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> MusicianGenerationResult:
+        """Generate MIDI with old tokens as prefix for continuity.
+
+        EXPERIMENTAL: May not work reliably with current Ollama setup.
+        Falls back to normal generation if prefix continuation fails.
+
+        Args:
+            instruction: New instruction
+            prefix_tokens: Previous MIDI token sequence
+            prefix_ratio: Fraction of old tokens to use as prefix (0.3 = 30%)
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            max_tokens: Maximum tokens to generate
+
+        Returns:
+            MusicianGenerationResult with new tokens
+
+        Note:
+            This method attempts to guide the model with old tokens,
+            but Ollama may not interpret them as actual continuation points.
+            Feature-based guidance (via enhanced instructions) is more reliable.
+        """
+        if not prefix_tokens:
+            return await self.generate(instruction, temperature, top_p, max_tokens)
+
+        # Use first 30% of old tokens as prefix
+        prefix_len = int(len(prefix_tokens) * prefix_ratio)
+        prefix = prefix_tokens[:prefix_len]
+
+        # Convert tokens back to string format for Ollama prompt
+        prefix_str = "".join([f"<|midi_token_{t}|>" for t in prefix])
+
+        # Build prompt: instruction + token prefix
+        full_prompt = (
+            f"{settings.system_prompt}{instruction}\n\n"
+            f"Continue from this musical start:\n{prefix_str}"
+        )
+
+        # Call Ollama with modified prompt
+        payload = {
+            "model": self.model,
+            "prompt": full_prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature or settings.default_temperature,
+                "top_p": top_p or settings.default_top_p,
+                "num_predict": max_tokens or settings.default_max_tokens,
+            },
+        }
+
+        response = await self.client.post(
+            f"{self.base_url}/api/generate",
+            json=payload,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        response_text = data.get("response", "")
+        generation_time_ms = data.get("total_duration", 0) / 1_000_000
+
+        # Extract tokens from response
+        all_tokens = self._extract_midi_tokens(response_text)
+
+        if not all_tokens:
+            raise ValueError(f"No MIDI tokens found in response: {response_text[:200]}")
+
+        return MusicianGenerationResult(
+            instruction=instruction,
+            midi_token_ids=all_tokens,
+            generation_time_ms=generation_time_ms,
+            raw_response=response_text,
+        )
+
     def _extract_midi_tokens(self, response_text: str) -> list[int]:
         """Extract and clean MIDI token IDs from Ollama response.
 

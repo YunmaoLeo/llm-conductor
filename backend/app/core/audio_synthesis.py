@@ -137,6 +137,9 @@ class AudioSynthesizer:
     ) -> tuple[Path, Path]:
         """Synthesize a single track from MIDI bytes.
 
+        Preserves the previous version by moving existing files to *_prev
+        before generating the new version. This allows version comparison.
+
         Args:
             track_id: Track identifier
             midi_bytes: MIDI file bytes
@@ -146,17 +149,30 @@ class AudioSynthesizer:
         Returns:
             Tuple of (midi_path, audio_path)
         """
+        import shutil
+
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Write MIDI file
+        # Define paths
         midi_path = output_dir / f"{track_id}.mid"
-        midi_path.write_bytes(midi_bytes)
-
-        # Convert to audio
         audio_ext = ".mp3" if format == "mp3" else f".{format}"
         audio_path = output_dir / f"{track_id}{audio_ext}"
 
+        # NEW: Backup existing files to _prev before overwriting
+        prev_midi_path = output_dir / f"{track_id}_prev.mid"
+        prev_audio_path = output_dir / f"{track_id}_prev{audio_ext}"
+
+        if midi_path.exists():
+            # Move current to previous (overwrites old _prev if exists)
+            shutil.move(str(midi_path), str(prev_midi_path))
+            if audio_path.exists():
+                shutil.move(str(audio_path), str(prev_audio_path))
+
+        # Write new MIDI file
+        midi_path.write_bytes(midi_bytes)
+
+        # Convert to audio
         self.midi_to_audio(midi_path, audio_path, format=format)
 
         return midi_path, audio_path

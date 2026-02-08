@@ -58,6 +58,8 @@ type TrackInfo = {
   audio_url: string;
   features: Record<string, unknown>;
   version: number;
+  has_previous_version?: boolean;  // NEW: Whether _prev files exist
+  previous_version_number?: number | null;  // NEW: Previous version number
 };
 
 type CompletionPayload = {
@@ -628,6 +630,7 @@ function TrackPanelInline({
               <TrackCard
                 key={`${track.id}-${track.version}`}
                 track={track}
+                compositionId={completion.composition_id}
                 isPending={pendingTracks.has(track.id)}
                 onDelete={() => onQuickAction(`Please delete ${track.id}.`)}
                 onRegenerate={() =>

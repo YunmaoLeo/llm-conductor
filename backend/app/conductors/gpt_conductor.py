@@ -33,6 +33,54 @@ class Track:
             f"(mean {self.features.pitch_mean:.0f})"
         )
 
+    def to_detailed_summary(self, include_style_hints: bool = False) -> str:
+        """Generate detailed summary including musical style characteristics.
+
+        Used for refinement operations to preserve musical continuity.
+
+        Args:
+            include_style_hints: Whether to include token count hints
+
+        Returns:
+            Detailed summary with style descriptors (sparse/dense, register, rhythm)
+        """
+        base = self.to_summary()  # Existing summary
+
+        # Add density characterization
+        if self.features.note_density < 1.0:
+            density_desc = "sparse"
+        elif self.features.note_density < 3.0:
+            density_desc = "moderate"
+        else:
+            density_desc = "dense"
+
+        # Add pitch characterization
+        pitch_mid = (self.features.pitch_range[0] + self.features.pitch_range[1]) / 2
+        if pitch_mid < 60:
+            register_desc = "low register"
+        elif pitch_mid < 72:
+            register_desc = "mid register"
+        else:
+            register_desc = "high register"
+
+        # Add rhythm characterization
+        onset_curve = self.features.onset_density_curve
+        if onset_curve:
+            import numpy as np
+            variance = np.std(onset_curve) if len(onset_curve) > 1 else 0
+            rhythm_desc = "steady rhythm" if variance < 2.0 else "varied rhythm"
+        else:
+            rhythm_desc = "unknown rhythm"
+
+        summary = f"{base}\nStyle: {density_desc}, {register_desc}, {rhythm_desc}"
+
+        if include_style_hints:
+            token_count = self.metadata.get("token_count", 0)
+            if token_count > 0:
+                summary += f", {token_count} tokens"
+
+        return summary
+
 
 @dataclass
 class CompositionState:
@@ -114,7 +162,8 @@ You must communicate in English only.
         "track_id": "required for modify/delete",
         "instrument": "Piano | Drums | Bass | Strings | Guitar ...",
         "role": "melody | harmony | rhythm | bass",
-        "instruction": "Detailed English prompt for the MIDI-LLM (style, tempo, feel, key, texture)"
+        "instruction": "Detailed English prompt for the MIDI-LLM (style, tempo, feel, key, texture)",
+        "refinement_mode": "full_regen | refine_style | refine_details (default: full_regen for regenerate_track, refine_style for modify_track)"
       }
     }
   ],
@@ -128,6 +177,15 @@ You must communicate in English only.
 3. Use gradual iteration: add or change a small number of tracks per turn.
 4. Be feature-driven: reference MIDI features, not vague guesses.
 5. Provide precise instructions to the MIDI-LLM.
+6. **When regenerating/modifying existing tracks, PRESERVE original style characteristics** unless user explicitly requests drastic changes:
+   - Maintain similar note density (±20%)
+   - Keep similar pitch register (±1 octave)
+   - Preserve rhythmic feel (steady vs varied)
+   - Use phrases like "keep the original density/register/rhythm but [modification]"
+
+**Refinement Mode Selection:**
+- Use "refine_style" mode when user says: adjust, tweak, slightly, more/less, minor change
+- Use "full_regen" mode when user says: completely change, redo, start over, different genre
 
 **Example:**
 User: "I want a calm piano piece"

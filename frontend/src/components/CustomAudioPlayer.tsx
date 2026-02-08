@@ -9,7 +9,7 @@ interface CustomAudioPlayerProps {
 export function CustomAudioPlayer({
   url,
   label: _label,
-  variant = 'track',
+  variant: _variant = 'track',
 }: CustomAudioPlayerProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const progressBarRef = useRef<HTMLDivElement | null>(null);
@@ -19,6 +19,7 @@ export function CustomAudioPlayer({
   const [volume, setVolume] = useState(0.7);
   const [isLoading, setIsLoading] = useState(true);
   const [showVolumeSlider, setShowVolumeSlider] = useState(false);
+  const volumeTimeoutRef = useRef<number | null>(null);
 
   // Initialize audio element
   useEffect(() => {
@@ -54,6 +55,15 @@ export function CustomAudioPlayer({
     audio.volume = volume;
   }, [volume]);
 
+  // Cleanup volume timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (volumeTimeoutRef.current) {
+        clearTimeout(volumeTimeoutRef.current);
+      }
+    };
+  }, []);
+
   const togglePlay = () => {
     const audio = audioRef.current;
     if (!audio) return;
@@ -82,6 +92,21 @@ export function CustomAudioPlayer({
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
     return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const handleVolumeMouseEnter = () => {
+    if (volumeTimeoutRef.current) {
+      clearTimeout(volumeTimeoutRef.current);
+      volumeTimeoutRef.current = null;
+    }
+    setShowVolumeSlider(true);
+  };
+
+  const handleVolumeMouseLeave = () => {
+    // Add a small delay before hiding to allow moving to the slider
+    volumeTimeoutRef.current = window.setTimeout(() => {
+      setShowVolumeSlider(false);
+    }, 200);
   };
 
   return (
@@ -146,8 +171,8 @@ export function CustomAudioPlayer({
         {/* Volume Control */}
         <div
           className="relative ml-auto"
-          onMouseEnter={() => setShowVolumeSlider(true)}
-          onMouseLeave={() => setShowVolumeSlider(false)}
+          onMouseEnter={handleVolumeMouseEnter}
+          onMouseLeave={handleVolumeMouseLeave}
         >
           <button
             className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/5 text-slate-400 transition-colors hover:bg-white/10 hover:text-slate-300"
@@ -169,16 +194,22 @@ export function CustomAudioPlayer({
           </button>
 
           {showVolumeSlider && (
-            <div className="absolute bottom-full right-0 mb-2 rounded-lg bg-slate-900/95 p-3 shadow-xl backdrop-blur-sm">
+            <div
+              className="absolute bottom-full right-0 mb-2 rounded-lg bg-slate-900/95 p-3 shadow-xl backdrop-blur-sm"
+              onMouseEnter={handleVolumeMouseEnter}
+              onMouseLeave={handleVolumeMouseLeave}
+            >
               <input
                 type="range"
                 min="0"
                 max="1"
                 step="0.01"
-                value={volume}
-                onChange={(e) => setVolume(parseFloat(e.target.value))}
+                value={1 - volume}
+                onChange={(e) => setVolume(1 - parseFloat(e.target.value))}
                 className="volume-slider h-20 w-6"
-                style={{ writingMode: 'vertical-lr' } as React.CSSProperties}
+                style={{
+                  '--volume-percent': `${volume * 100}%`,
+                } as React.CSSProperties}
               />
             </div>
           )}

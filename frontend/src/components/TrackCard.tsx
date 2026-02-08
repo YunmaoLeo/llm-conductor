@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { CustomAudioPlayer } from './CustomAudioPlayer';
+import ComparisonView from './ComparisonView';
+import type { MusicFeatures } from '../types';
 
 interface TrackCardProps {
   track: {
@@ -10,7 +12,10 @@ interface TrackCardProps {
     audio_url: string;
     features: Record<string, unknown>;
     version: number;
+    has_previous_version?: boolean;  // NEW
+    previous_version_number?: number | null;  // NEW
   };
+  compositionId: string;  // NEW: Required for comparison API calls
   isPending: boolean;
   onDelete: () => void;
   onRegenerate: () => void;
@@ -18,12 +23,14 @@ interface TrackCardProps {
 
 export function TrackCard({
   track,
+  compositionId,
   isPending,
   onDelete,
   onRegenerate,
 }: TrackCardProps) {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [showComparison, setShowComparison] = useState(false);  // NEW: Comparison state
 
   const handleDelete = () => {
     if (!showDeleteConfirm) {
@@ -102,6 +109,29 @@ export function TrackCard({
               />
             </svg>
           </button>
+
+          {/* Compare Button - Only show if previous version exists */}
+          {track.has_previous_version && (
+            <button
+              onClick={() => setShowComparison(!showComparison)}
+              className={`flex h-8 w-8 items-center justify-center rounded-lg transition-all ${
+                showComparison
+                  ? 'bg-blue-500/30 text-blue-300 ring-2 ring-blue-400/50'
+                  : 'bg-white/5 text-slate-400 hover:bg-blue-500/20 hover:text-blue-300'
+              }`}
+              aria-label="Compare versions"
+              title="Compare with previous version"
+            >
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"
+                />
+              </svg>
+            </button>
+          )}
 
           <button
             onClick={handleDelete}
@@ -201,6 +231,23 @@ export function TrackCard({
           MIDI
         </a>
       </div>
+
+      {/* Comparison View */}
+      {showComparison && track.has_previous_version && (
+        <ComparisonView
+          trackId={track.id}
+          compositionId={compositionId}
+          currentVersion={{
+            audio_url: track.audio_url,
+            features: track.features as any as MusicFeatures,
+            version: track.version,
+          }}
+          previousVersion={{
+            audio_url: `/api/tracks/${compositionId}/${track.id}/previous?type=audio`,
+            // Features will be fetched by ComparisonView from API
+          }}
+        />
+      )}
     </div>
   );
 }
