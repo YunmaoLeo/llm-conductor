@@ -89,6 +89,13 @@ You must communicate in English only.
 - Perform audio signal processing
 - Remember full conversation history (only current state is provided)
 
+**CRITICAL: Single-Instrument Per Track Rule**
+- Each track MUST use ONLY ONE instrument (Piano, Strings, Bass, etc.)
+- NEVER ask for multiple instruments in a single instruction
+- BAD: "Piano and strings melody"
+- GOOD: Create two separate tracks - one for piano, one for strings
+- Be very specific in your instruction: emphasize "ONLY [instrument], no other instruments"
+
 **MIDI feature schema:**
 - `note_density`: notes/sec (higher means denser)
 - `pitch_range`: MIDI pitch range (60 = middle C)
@@ -133,11 +140,16 @@ Output:
     "parameters": {
       "instrument": "Piano",
       "role": "melody",
-      "instruction": "Calm piano melody in C major, slow tempo around 70 BPM, sparse eighth notes, middle register (C4-C6), gentle dynamics, peaceful mood"
+      "instruction": "ONLY piano, no other instruments. Calm piano melody in C major, slow tempo around 70 BPM, sparse eighth notes, middle register (C4-C6), gentle dynamics, peaceful mood. Single piano track only."
     }
   }]
 }
 ```
+
+**Instructions to MIDI-LLM must emphasize single instrument:**
+- Always start with "ONLY [instrument], no other instruments"
+- End with "Single [instrument] track only"
+- Be very explicit to prevent multi-instrument generation
 
 Now, based on the user's message and the current composition state, output your reply and action plan as JSON."""
 

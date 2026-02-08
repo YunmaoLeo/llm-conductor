@@ -186,6 +186,7 @@ async def _execute_create_track(
     composition_id: str,
     session_dir: Path,
     parameters: dict,
+    websocket: Optional[WebSocket] = None,
 ) -> None:
     """Execute a create_track action.
 
@@ -193,12 +194,23 @@ async def _execute_create_track(
         composition_id: Composition ID
         session_dir: Session output directory
         parameters: Action parameters (instrument, role, instruction)
+        websocket: Optional WebSocket for debug messages
     """
     instrument = _infer_instrument(
         parameters.get("instrument", ""), parameters.get("instruction", "")
     )
     role = parameters.get("role", "melody")
     instruction = parameters.get("instruction", "")
+
+    # Send debug message with MIDI-LLM prompt
+    if websocket:
+        await websocket.send_json({
+            "type": "debug",
+            "data": {
+                "message": f"[MIDI-LLM] Generating {instrument} ({role})",
+                "prompt": instruction,
+            },
+        })
 
     # Generate MIDI tokens using MIDI-LLM
     musician = MIDILLMMusician()
@@ -247,6 +259,7 @@ async def _execute_regenerate_track(
     composition_id: str,
     session_dir: Path,
     parameters: dict,
+    websocket: Optional[WebSocket] = None,
 ) -> None:
     """Execute a regenerate_track action."""
     track_id = parameters.get("track_id")
@@ -262,6 +275,16 @@ async def _execute_regenerate_track(
         parameters.get("instrument", ""), instruction or existing.instrument
     )
     role = parameters.get("role", existing.role)
+
+    # Send debug message with MIDI-LLM prompt
+    if websocket:
+        await websocket.send_json({
+            "type": "debug",
+            "data": {
+                "message": f"[MIDI-LLM] Regenerating {track_id} ({instrument})",
+                "prompt": instruction,
+            },
+        })
 
     musician = MIDILLMMusician()
     try:
@@ -367,7 +390,16 @@ def _mix_url(composition_id: str, filename: str, version: int | None) -> str:
 def _apply_instrument_override(
     pretty, instrument_name: str
 ) -> tuple[bytes, "pretty_midi.PrettyMIDI"]:
-    """Force the instrument program to match the requested instrument."""
+    """Force the instrument to be single-track with the requested instrument.
+
+    CRITICAL FIX: MIDI-LLM often generates multiple instrument tracks (piano+strings+bass).
+    This function now:
+    1. Merges all non-drum tracks into a SINGLE track
+    2. Sets the program to the requested instrument
+    3. Removes duplicate/overlapping notes
+
+    This ensures clean, single-instrument tracks instead of chaotic multi-instrument mixes.
+    """
     import pretty_midi
 
     program_map = {
@@ -403,15 +435,63 @@ def _apply_instrument_override(
                 target = value
                 break
 
+    # Handle drums specially
     if "drum" in name:
-        for inst in pretty.instruments:
-            inst.is_drum = True
-        target = None
+        drum_tracks = [inst for inst in pretty.instruments if inst.is_drum]
+        if drum_tracks:
+            pretty.instruments = drum_tracks[:1]  # Keep only first drum track
+        else:
+            # Convert first track to drums
+            if pretty.instruments:
+                pretty.instruments[0].is_drum = True
+                pretty.instruments = pretty.instruments[:1]
+        buf = io.BytesIO()
+        pretty.write(buf)
+        return buf.getvalue(), pretty
 
+    # For non-drum instruments: MERGE all non-drum tracks into ONE
     if target is not None:
-        for inst in pretty.instruments:
-            if not inst.is_drum:
-                inst.program = target
+        non_drum_instruments = [inst for inst in pretty.instruments if not inst.is_drum]
+
+        if not non_drum_instruments:
+            # No non-drum tracks, create empty one
+            merged = pretty_midi.Instrument(program=target, is_drum=False, name=instrument_name)
+        elif len(non_drum_instruments) == 1:
+            # Only one track, just change program
+            merged = non_drum_instruments[0]
+            merged.program = target
+            merged.name = instrument_name
+        else:
+            # MULTIPLE TRACKS - MERGE THEM
+            merged = pretty_midi.Instrument(program=target, is_drum=False, name=instrument_name)
+
+            # Collect all notes from all non-drum tracks
+            all_notes = []
+            for inst in non_drum_instruments:
+                all_notes.extend(inst.notes)
+
+            # Sort by start time
+            all_notes.sort(key=lambda n: n.start)
+
+            # Remove overlapping/duplicate notes (keep unique notes only)
+            unique_notes = []
+            for note in all_notes:
+                # Check if this note is too similar to existing notes
+                is_duplicate = False
+                for existing in unique_notes:
+                    # Same pitch, overlapping time → duplicate
+                    if (note.pitch == existing.pitch and
+                        abs(note.start - existing.start) < 0.05):  # Within 50ms
+                        is_duplicate = True
+                        break
+
+                if not is_duplicate:
+                    unique_notes.append(note)
+
+            merged.notes = unique_notes
+
+        # Replace all instruments with the single merged track
+        pretty.instruments = [merged]
 
     buf = io.BytesIO()
     pretty.write(buf)
@@ -623,6 +703,7 @@ async def chat_ws(websocket: WebSocket):
                         composition_id=composition_id,
                         session_dir=session_dir,
                         parameters=action.parameters,
+                        websocket=websocket,
                     )
                     updated_state = track_manager.get_state(composition_id)
                     if updated_state and updated_state.tracks:
@@ -653,6 +734,7 @@ async def chat_ws(websocket: WebSocket):
                         composition_id=composition_id,
                         session_dir=session_dir,
                         parameters=action.parameters,
+                        websocket=websocket,
                     )
                     updated_state = track_manager.get_state(composition_id)
                     track_id = action.parameters.get("track_id")
