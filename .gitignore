@@ -28,3 +28,6 @@ soundfonts/
 # Environment
 .env
 .env.local
+
+# Documentation (private notes and technical documentation)
+docs/

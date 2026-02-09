@@ -19,6 +19,7 @@ dependencies = [
     "pyloudnorm",
     "websockets",
     "python-multipart",
+    "pydub",  # NEW: For audio mixing with volume control
 ]
 
 [project.optional-dependencies]

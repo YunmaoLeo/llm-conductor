@@ -182,27 +182,92 @@ class AudioSynthesizer:
         composition_id: str,
         track_midi_paths: list[Path],
         output_dir: Path,
+        track_volumes: Optional[dict[str, float]] = None,
         format: str = "mp3",
     ) -> tuple[Path, Path]:
-        """Synthesize a mixed version of all tracks.
+        """Synthesize a mixed version of all tracks with volume control.
 
         Args:
             composition_id: Composition identifier
             track_midi_paths: List of track MIDI paths
             output_dir: Output directory
+            track_volumes: Dict mapping track filenames to volume (0.0-1.0)
             format: Audio format
 
         Returns:
             Tuple of (combined_midi_path, mixed_audio_path)
         """
-        # Combine MIDI tracks
+        from pydub import AudioSegment
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        # Combine MIDI tracks (for reference)
         combined_midi = output_dir / f"{composition_id}_mix.mid"
         self.combine_tracks(track_midi_paths, combined_midi)
 
-        # Convert to audio
-        audio_ext = ".mp3" if format == "mp3" else f".{format}"
-        mixed_audio = output_dir / f"{composition_id}_mix{audio_ext}"
+        # NEW: Render each track to WAV with volume control, then mix
+        if track_volumes:
+            logger.info(f"Mixing {len(track_midi_paths)} tracks with volume control")
 
-        self.midi_to_audio(combined_midi, mixed_audio, format=format)
+            # Render each track to WAV
+            track_audio_segments = []
+            for midi_path in track_midi_paths:
+                # Render MIDI to WAV
+                wav_path = output_dir / f"{midi_path.stem}_temp.wav"
+                self.midi_to_audio(midi_path, wav_path, format="wav")
+
+                # Load WAV
+                audio = AudioSegment.from_wav(str(wav_path))
+
+                # Apply volume
+                track_filename = midi_path.name
+                volume = track_volumes.get(track_filename, 1.0)
+
+                # Convert volume (0.0-1.0) to dB change
+                # 0.0 = -inf dB (silence)
+                # 0.5 = -6 dB (half perceived volume)
+                # 1.0 = 0 dB (original)
+                if volume <= 0.0:
+                    # Silence - skip this track
+                    logger.info(f"Track {track_filename} muted (volume=0.0)")
+                    wav_path.unlink()  # Delete temp file
+                    continue
+                elif volume < 1.0:
+                    db_change = 20 * __import__('math').log10(volume)
+                    audio = audio + db_change
+                    logger.info(f"Track {track_filename} volume={volume:.2f} ({db_change:+.1f} dB)")
+                else:
+                    logger.info(f"Track {track_filename} volume=1.0 (no change)")
+
+                track_audio_segments.append(audio)
+
+                # Clean up temp WAV
+                wav_path.unlink()
+
+            # Mix all tracks
+            if not track_audio_segments:
+                raise ValueError("No tracks to mix (all muted?)")
+
+            mixed_audio_segment = track_audio_segments[0]
+            for audio in track_audio_segments[1:]:
+                # Overlay tracks (mix them together)
+                mixed_audio_segment = mixed_audio_segment.overlay(audio)
+
+            # Export mixed audio
+            audio_ext = ".mp3" if format == "mp3" else f".{format}"
+            mixed_audio = output_dir / f"{composition_id}_mix{audio_ext}"
+
+            if format == "mp3":
+                mixed_audio_segment.export(str(mixed_audio), format="mp3", bitrate="192k")
+            else:
+                mixed_audio_segment.export(str(mixed_audio), format=format)
+
+        else:
+            # Fallback: no volume control, use old method
+            logger.info(f"Mixing {len(track_midi_paths)} tracks without volume control")
+            audio_ext = ".mp3" if format == "mp3" else f".{format}"
+            mixed_audio = output_dir / f"{composition_id}_mix{audio_ext}"
+            self.midi_to_audio(combined_midi, mixed_audio, format=format)
 
         return combined_midi, mixed_audio

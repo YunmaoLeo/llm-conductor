@@ -187,6 +187,100 @@ class MIDILLMMusician:
             raw_response=response_text,
         )
 
+    async def generate_with_reference(
+        self,
+        instruction: str,
+        reference_tokens: list[int],
+        reference_instrument: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> MusicianGenerationResult:
+        """Generate MIDI that matches/complements a reference track.
+
+        This method provides the reference track's tokens as musical context,
+        allowing MIDI-LLM to generate complementary parts (e.g., bass matching piano).
+
+        Args:
+            instruction: Generation instruction (e.g., "bass line that follows harmony")
+            reference_tokens: Tokens from reference track to match/complement
+            reference_instrument: Instrument name of reference track (for context)
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            max_tokens: Maximum tokens to generate
+
+        Returns:
+            MusicianGenerationResult with new tokens
+
+        Note:
+            The reference tokens are provided as "musical context" in the prompt.
+            MIDI-LLM can "see" what the reference track is doing and generate
+            complementary material. This is especially useful for:
+            - Bass lines that follow harmonic progression
+            - Harmony that complements melody
+            - Rhythmic patterns that sync with existing drums
+        """
+        if not reference_tokens:
+            return await self.generate(instruction, temperature, top_p, max_tokens)
+
+        # Sample reference tokens (use first 50% to avoid context overflow)
+        # Full track might be too long for Ollama context window
+        sample_size = min(len(reference_tokens) // 2, 300)  # Max 300 tokens
+        reference_sample = reference_tokens[:sample_size]
+
+        # Convert reference tokens to string format
+        reference_str = "".join([f"<|midi_token_{t}|>" for t in reference_sample])
+
+        # Build prompt with reference context
+        reference_context = f"Reference track ({reference_instrument or 'unknown'}):\n{reference_str}\n\n"
+        full_prompt = (
+            f"{settings.system_prompt}"
+            f"{reference_context}"
+            f"Generate new track that complements the reference:\n{instruction}"
+        )
+
+        logger.info(
+            f"Generating with reference: {len(reference_sample)} reference tokens, "
+            f"instrument: {reference_instrument}"
+        )
+
+        # Call Ollama with reference context
+        payload = {
+            "model": self.model,
+            "prompt": full_prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature or settings.default_temperature,
+                "top_p": top_p or settings.default_top_p,
+                "num_predict": max_tokens or settings.default_max_tokens,
+            },
+        }
+
+        start_time = time.time()
+
+        response = await self.client.post(
+            f"{self.base_url}/api/generate",
+            json=payload,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        response_text = data.get("response", "")
+        generation_time_ms = (time.time() - start_time) * 1000
+
+        # Extract tokens from response
+        all_tokens = self._extract_midi_tokens(response_text)
+
+        if not all_tokens:
+            raise ValueError(f"No MIDI tokens found in response: {response_text[:200]}")
+
+        return MusicianGenerationResult(
+            instruction=instruction,
+            midi_token_ids=all_tokens,
+            generation_time_ms=generation_time_ms,
+            raw_response=response_text,
+        )
+
     def _extract_midi_tokens(self, response_text: str) -> list[int]:
         """Extract and clean MIDI token IDs from Ollama response.
 

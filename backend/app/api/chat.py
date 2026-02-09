@@ -147,6 +147,12 @@ async def chat(request: ChatRequest) -> ChatResponse:
             if track_id:
                 track_manager.remove_track(composition_id, track_id)
 
+        elif action.type == "adjust_volume":
+            await _execute_adjust_volume(
+                composition_id=composition_id,
+                parameters=action.parameters,
+            )
+
         # modify_track is supported
 
     # Save conversation turn
@@ -176,6 +182,69 @@ async def chat(request: ChatRequest) -> ChatResponse:
     )
 
 
+def _analyze_feature_change_magnitude(instruction: str, track) -> float:
+    """Analyze how much the instruction requests feature changes.
+
+    Detects keywords and numerical targets in the instruction to estimate
+    the magnitude of requested changes. Returns a value between 0.0 (no change)
+    and 1.0+ (very large change).
+
+    Args:
+        instruction: User's modification instruction
+        track: Existing track with current features
+
+    Returns:
+        Change magnitude (0.0-1.0+, where >0.5 is considered "large")
+    """
+    import re
+
+    instruction_lower = instruction.lower()
+    current_density = track.features.note_density
+
+    # Initialize change score
+    change_score = 0.0
+
+    # Detect explicit density/tempo change requests
+    density_keywords = {
+        "sparse": 0.8,      # "make it sparse" = large change if currently dense
+        "simpler": 0.6,
+        "minimal": 0.7,
+        "reduce": 0.5,
+        "decrease": 0.5,
+        "less busy": 0.6,
+        "slower": 0.4,
+        "much slower": 0.7,
+        "drastically": 0.8,
+        "completely different": 1.0,
+        "totally different": 1.0,
+        "change style": 0.9,
+    }
+
+    for keyword, weight in density_keywords.items():
+        if keyword in instruction_lower:
+            change_score = max(change_score, weight)
+
+    # Detect numerical density targets (e.g., "2 notes per second", "density 1.5")
+    density_pattern = r"(?:density|notes?[\s/]+(?:per|\/)\s*(?:sec|second))[\s:]*(\d+(?:\.\d+)?)"
+    match = re.search(density_pattern, instruction_lower)
+    if match:
+        target_density = float(match.group(1))
+        # Calculate relative change
+        if current_density > 0:
+            density_change = abs(target_density - current_density) / current_density
+            change_score = max(change_score, min(density_change, 1.0))
+
+    # Detect pitch range changes
+    if any(word in instruction_lower for word in ["octave", "higher", "lower", "transpose"]):
+        change_score = max(change_score, 0.4)
+
+    # Detect style/genre changes
+    if any(word in instruction_lower for word in ["jazz", "classical", "rock", "blues", "style"]):
+        change_score = max(change_score, 0.7)
+
+    return change_score
+
+
 def _build_refinement_instruction(
     base_instruction: str,
     track,  # Track object from gpt_conductor
@@ -186,32 +255,43 @@ def _build_refinement_instruction(
     Args:
         base_instruction: User's modification request
         track: Existing track to refine
-        mode: Refinement mode (style, details, or full_regen)
+        mode: Refinement mode (refinement, variation, or rewrite)
 
     Returns:
-        Enhanced instruction with style preservation hints
+        Enhanced instruction with appropriate preservation hints
     """
-    if mode == "full_regen":
+    if mode == "rewrite":
         return base_instruction  # No preservation needed
 
     # Extract style descriptors from track features
     features = track.features
-    density = "sparse" if features.note_density < 1.0 else "dense"
+
+    # Density characterization
+    if features.note_density < 1.0:
+        density = "sparse"
+    elif features.note_density < 3.0:
+        density = "moderate"
+    else:
+        density = "dense"
+
+    # Register characterization
     pitch_mid = (features.pitch_range[0] + features.pitch_range[1]) / 2
     register = "low" if pitch_mid < 60 else "mid" if pitch_mid < 72 else "high"
 
-    if mode == "refine_style":
+    if mode == "refinement":
+        # Strong preservation: maintain overall character
         template = (
-            f"PRESERVE: {density} texture, {register} register, "
-            f"pitch range {features.pitch_range[0]}-{features.pitch_range[1]}\n"
+            f"PRESERVE: {density} texture ({features.note_density:.1f} notes/sec), "
+            f"{register} register (pitch range {features.pitch_range[0]}-{features.pitch_range[1]})\n"
             f"MODIFY: {base_instruction}\n"
-            f"Keep overall musical character similar."
+            f"Keep overall musical character and style similar, only make the requested adjustments."
         )
-    elif mode == "refine_details":
+    elif mode == "variation":
+        # Moderate preservation: allow more freedom
         template = (
-            f"KEEP ALMOST EVERYTHING: Current density={features.note_density:.1f}, "
-            f"register={register}\n"
-            f"SMALL ADJUSTMENT: {base_instruction}"
+            f"REFERENCE STYLE: {density} texture, {register} register\n"
+            f"VARIATION REQUEST: {base_instruction}\n"
+            f"You may deviate from the reference style to achieve the requested variation."
         )
     else:
         template = base_instruction
@@ -230,7 +310,7 @@ async def _execute_create_track(
     Args:
         composition_id: Composition ID
         session_dir: Session output directory
-        parameters: Action parameters (instrument, role, instruction)
+        parameters: Action parameters (instrument, role, instruction, reference_track_id)
         websocket: Optional WebSocket for debug messages
     """
     instrument = _infer_instrument(
@@ -238,21 +318,58 @@ async def _execute_create_track(
     )
     role = parameters.get("role", "melody")
     instruction = parameters.get("instruction", "")
+    reference_track_id = parameters.get("reference_track_id")  # Reference track
+    volume = parameters.get("volume", 1.0)  # NEW: Track volume (0.0-1.0, default 1.0)
+
+    # NEW: Get reference track tokens if specified
+    reference_tokens = None
+    reference_track = None
+    if reference_track_id:
+        reference_track = track_manager.get_track(composition_id, reference_track_id)
+        if reference_track:
+            reference_tokens = reference_track.metadata.get("midi_token_ids", [])
+            if reference_tokens:
+                logger.info(
+                    f"Using reference track {reference_track_id} "
+                    f"({reference_track.instrument}) with {len(reference_tokens)} tokens"
+                )
 
     # Send debug message with MIDI-LLM prompt
     if websocket:
+        debug_data = {
+            "message": f"[MIDI-LLM] Generating {instrument} ({role})",
+            "prompt": instruction,
+        }
+        if reference_track:
+            debug_data["reference_track"] = f"{reference_track_id} ({reference_track.instrument})"
+            debug_data["reference_tokens"] = len(reference_tokens) if reference_tokens else 0
+
         await websocket.send_json({
             "type": "debug",
-            "data": {
-                "message": f"[MIDI-LLM] Generating {instrument} ({role})",
-                "prompt": instruction,
-            },
+            "data": debug_data,
         })
 
     # Generate MIDI tokens using MIDI-LLM
     musician = MIDILLMMusician()
     try:
-        result = await musician.generate(instruction)
+        # NEW: Use generate_with_reference if reference tokens available
+        if reference_tokens and hasattr(musician, 'generate_with_reference'):
+            try:
+                logger.info(f"Generating with reference to {reference_track_id}")
+                result = await musician.generate_with_reference(
+                    instruction=instruction,
+                    reference_tokens=reference_tokens,
+                    reference_instrument=reference_track.instrument if reference_track else None,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Reference-based generation failed: {e}, "
+                    "falling back to normal generation"
+                )
+                result = await musician.generate(instruction)
+        else:
+            # Standard generation without reference
+            result = await musician.generate(instruction)
     finally:
         await musician.close()
 
@@ -288,8 +405,9 @@ async def _execute_create_track(
             "instruction": instruction,
             "token_count": len(result.midi_token_ids),
             "generation_time_ms": result.generation_time_ms,
-            "midi_token_ids": result.midi_token_ids,  # NEW: Save tokens for future refinement
-            "refinement_history": [],  # NEW: Track refinement chain
+            "midi_token_ids": result.midi_token_ids,  # Save tokens for future refinement
+            "refinement_history": [],  # Track refinement chain
+            "volume": volume,  # NEW: Track volume for mixing (0.0-1.0)
         },
     )
 
@@ -314,20 +432,33 @@ async def _execute_regenerate_track(
     old_tokens = existing.metadata.get("midi_token_ids", [])
     old_instruction = existing.metadata.get("instruction", "")
 
+    # NEW: Get volume (preserve existing if not specified)
+    volume = parameters.get("volume", existing.metadata.get("volume", 1.0))
+
     instrument = _infer_instrument(
         parameters.get("instrument", ""), instruction or existing.instrument
     )
     role = parameters.get("role", existing.role)
 
-    # Check refinement mode for style preservation and progress notifications
-    refinement_mode = parameters.get("refinement_mode", "full_regen")
+    # Check refinement mode and preserve_style flag
+    refinement_mode = parameters.get("refinement_mode", "refinement")  # Changed default
+    preserve_style = parameters.get("preserve_style", True)  # NEW: Default to preserving style
+
+    # Analyze requested feature changes to detect large modifications
+    feature_change_magnitude = _analyze_feature_change_magnitude(instruction, existing)
+
+    # Auto-disable style preservation for large changes
+    if feature_change_magnitude > 0.5:  # >50% change
+        preserve_style = False
+        logger.info(f"Large feature change detected ({feature_change_magnitude:.1%}), disabling token prefix")
 
     # Send debug message with MIDI-LLM prompt and refinement mode
     if websocket:
         mode_label = {
             "full_regen": "Full Regeneration",
-            "refine_style": "Style Refinement",
-            "refine_details": "Detail Refinement",
+            "refinement": "Refinement (with token prefix)",
+            "variation": "Variation (partial preservation)",
+            "rewrite": "Complete Rewrite",
         }.get(refinement_mode, refinement_mode)
 
         await websocket.send_json({
@@ -336,22 +467,26 @@ async def _execute_regenerate_track(
                 "message": f"[MIDI-LLM] {mode_label}: {track_id} ({instrument})",
                 "prompt": instruction,
                 "refinement_mode": refinement_mode,
+                "preserve_style": preserve_style,
+                "feature_change": f"{feature_change_magnitude:.1%}",
             },
         })
 
-    # Enhance instruction based on refinement mode
-    if refinement_mode == "refine_style" and existing:
-        instruction = _build_refinement_instruction(
-            base_instruction=instruction,
-            track=existing,
-            mode="style"
-        )
-    elif refinement_mode == "refine_details" and existing:
-        instruction = _build_refinement_instruction(
-            base_instruction=instruction,
-            track=existing,
-            mode="refine_details"
-        )
+    # Enhance instruction based on refinement mode and preserve_style flag
+    if existing and preserve_style:
+        if refinement_mode == "refinement":
+            instruction = _build_refinement_instruction(
+                base_instruction=instruction,
+                track=existing,
+                mode="refinement"
+            )
+        elif refinement_mode == "variation":
+            instruction = _build_refinement_instruction(
+                base_instruction=instruction,
+                track=existing,
+                mode="variation"
+            )
+    # If preserve_style is False or mode is "rewrite", don't add preservation constraints
 
     # Prepend track state summary to instruction for better continuity
     context_prefix = ""
@@ -368,23 +503,44 @@ async def _execute_regenerate_track(
 
     musician = MIDILLMMusician()
     try:
-        # Experimental: Try token prefix continuation for refine_style mode
-        if refinement_mode == "refine_style" and old_tokens:
+        # Adaptive token prefix based on preserve_style and change magnitude
+        if old_tokens and preserve_style:
+            # Calculate adaptive prefix ratio based on change magnitude
+            # Large changes → smaller prefix ratio (less constraint)
+            # Small changes → larger prefix ratio (more preservation)
+            base_prefix_ratio = 0.5  # Default: use 50% of old tokens
+
+            if feature_change_magnitude < 0.2:  # Small change (<20%)
+                prefix_ratio = 0.6  # Use more of the old tokens
+            elif feature_change_magnitude < 0.4:  # Moderate change (20-40%)
+                prefix_ratio = 0.4  # Use less of the old tokens
+            else:  # Large change (>40% but <50%, otherwise preserve_style would be False)
+                prefix_ratio = 0.25  # Use minimal prefix for maximum flexibility
+
             if hasattr(musician, 'generate_with_prefix'):
                 try:
-                    logger.info(f"Attempting token prefix continuation with {len(old_tokens)} old tokens")
+                    logger.info(
+                        f"Using token prefix continuation: {len(old_tokens)} tokens, "
+                        f"ratio={prefix_ratio:.1%} (change magnitude: {feature_change_magnitude:.1%})"
+                    )
                     result = await musician.generate_with_prefix(
                         instruction=full_instruction,
                         prefix_tokens=old_tokens,
-                        prefix_ratio=0.3,
+                        prefix_ratio=prefix_ratio,
                     )
                 except Exception as e:
                     logger.warning(f"Prefix continuation failed: {e}, falling back to normal generation")
                     result = await musician.generate(full_instruction)
             else:
+                # Fallback if generate_with_prefix not available
+                logger.info("generate_with_prefix not available, using normal generation")
                 result = await musician.generate(full_instruction)
         else:
-            # Full regeneration (current behavior)
+            # Full regeneration: no token prefix (large change or preserve_style=False)
+            logger.info(
+                f"Full regeneration without token prefix "
+                f"(preserve_style={preserve_style}, change={feature_change_magnitude:.1%})"
+            )
             result = await musician.generate(full_instruction)
     finally:
         await musician.close()
@@ -425,6 +581,7 @@ async def _execute_regenerate_track(
                 "instruction": old_instruction,
                 "token_count": len(old_tokens),
             }] if old_tokens else existing.metadata.get("refinement_history", []),
+            "volume": volume,  # NEW: Track volume for mixing
         },
     )
 
@@ -501,6 +658,76 @@ async def _execute_modify_track(
             "role": role,
         },
     )
+
+
+async def _execute_adjust_volume(
+    composition_id: str,
+    parameters: dict,
+    websocket: Optional[WebSocket] = None,
+) -> None:
+    """Execute a volume adjustment without regenerating the track.
+
+    This is a lightweight operation that only updates the track's volume metadata
+    and triggers a mix regeneration. The track's MIDI and audio files remain unchanged.
+
+    Args:
+        composition_id: Composition ID
+        parameters: Action parameters (track_id, volume)
+        websocket: Optional WebSocket for progress messages
+    """
+    track_id = parameters.get("track_id")
+    new_volume = parameters.get("volume")
+
+    if not track_id or new_volume is None:
+        logger.warning("adjust_volume missing track_id or volume parameter")
+        return
+
+    # Validate volume range
+    if not (0.0 <= new_volume <= 1.0):
+        logger.warning(f"Invalid volume {new_volume}, must be 0.0-1.0")
+        new_volume = max(0.0, min(1.0, new_volume))  # Clamp to valid range
+
+    existing = track_manager.get_track(composition_id, track_id)
+    if not existing:
+        logger.warning(f"Track {track_id} not found for volume adjustment")
+        return
+
+    old_volume = existing.metadata.get("volume", 1.0)
+
+    # Send debug message
+    if websocket:
+        await websocket.send_json({
+            "type": "debug",
+            "data": {
+                "message": f"[Volume] Adjusting {track_id} volume: {old_volume:.2f} → {new_volume:.2f}",
+                "old_volume": old_volume,
+                "new_volume": new_volume,
+            },
+        })
+
+    logger.info(
+        f"Adjusting volume for {track_id}: {old_volume:.2f} → {new_volume:.2f} "
+        f"(no regeneration, mix will be updated)"
+    )
+
+    # Update only the volume in metadata (no MIDI/audio regeneration)
+    updated_metadata = existing.metadata.copy()
+    updated_metadata["volume"] = new_volume
+
+    track_manager.update_track(
+        composition_id=composition_id,
+        track_id=track_id,
+        instrument=existing.instrument,
+        role=existing.role,
+        midi_path=existing.midi_path,
+        audio_path=existing.audio_path,
+        features=existing.features,
+        metadata=updated_metadata,
+    )
+
+    # NOTE: The mix will be automatically regenerated when requested
+    # because the track metadata has changed (volume is different)
+    logger.info(f"Volume adjustment complete for {track_id}, mix will regenerate on next request")
 
 
 def _track_url(composition_id: str, track_id: str, ext: str, version: int) -> str:
@@ -721,12 +948,21 @@ async def _ensure_mix(
             }
 
     track_midi_paths = [Path(track.midi_path) for track in composition_state.tracks]
+
+    # NEW: Extract track volumes from metadata
+    track_volumes = {}
+    for track in composition_state.tracks:
+        midi_filename = Path(track.midi_path).name
+        volume = track.metadata.get("volume", 1.0)  # Default to 1.0 (full volume)
+        track_volumes[midi_filename] = volume
+
     synthesizer = get_audio_synthesizer()
     try:
         combined_midi, mixed_audio = synthesizer.synthesize_mix(
             composition_id=composition_id,
             track_midi_paths=track_midi_paths,
             output_dir=session_dir,
+            track_volumes=track_volumes,  # NEW: Pass volumes
             format="mp3",
         )
     except Exception as e:
@@ -922,6 +1158,38 @@ async def chat_ws(websocket: WebSocket):
                         session_dir=session_dir,
                         parameters=action.parameters,
                         websocket=websocket,  # NEW: Pass websocket for prompt logging
+                    )
+                    updated_state = track_manager.get_state(composition_id)
+                    track_id = action.parameters.get("track_id")
+                    if updated_state and track_id:
+                        updated_track = track_manager.get_track(composition_id, track_id)
+                        if updated_track:
+                            await websocket.send_json({
+                                "type": "track_updated",
+                                "data": {
+                                    "track_id": updated_track.id,
+                                    "instrument": updated_track.instrument,
+                                    "role": updated_track.role,
+                                    "midi_url": _track_url(
+                                        composition_id,
+                                        updated_track.id,
+                                        "mid",
+                                        updated_track.metadata.get("version", 1),
+                                    ),
+                                    "audio_url": _track_url(
+                                        composition_id,
+                                        updated_track.id,
+                                        "mp3",
+                                        updated_track.metadata.get("version", 1),
+                                    ),
+                                },
+                            })
+
+                elif action.type == "adjust_volume":
+                    await _execute_adjust_volume(
+                        composition_id=composition_id,
+                        parameters=action.parameters,
+                        websocket=websocket,
                     )
                     updated_state = track_manager.get_state(composition_id)
                     track_id = action.parameters.get("track_id")
