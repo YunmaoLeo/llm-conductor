@@ -24,14 +24,28 @@ class Track:
 
     def to_summary(self) -> str:
         """Convert track to human-readable summary for GPT."""
-        return (
+        parts = [
             f"Track {self.id} ({self.instrument}, {self.role}): "
             f"{self.features.note_count} notes, "
             f"{self.features.duration_seconds:.1f}s, "
             f"density {self.features.note_density:.1f} notes/sec, "
             f"pitch range {self.features.pitch_range[0]}-{self.features.pitch_range[1]} "
             f"(mean {self.features.pitch_mean:.0f})"
-        )
+        ]
+
+        # Include key and tempo if detected
+        if self.features.estimated_key:
+            key_name, mode = self.features.estimated_key
+            parts.append(f", Key={key_name} {mode} (conf={self.features.key_confidence:.2f})")
+        if self.features.estimated_tempo > 0:
+            parts.append(f", Tempo~{self.features.estimated_tempo:.0f} BPM")
+
+        # Include volume if non-default
+        volume = self.metadata.get("volume", 1.0)
+        if volume != 1.0:
+            parts.append(f", Volume={volume:.0%}")
+
+        return "".join(parts)
 
     def to_detailed_summary(self, include_style_hints: bool = False) -> str:
         """Generate detailed summary including musical style characteristics.
@@ -99,8 +113,11 @@ class CompositionState:
         for track in self.tracks:
             context += f"- {track.to_summary()}\n"
 
-        if self.metadata:
-            context += f"\nGlobal metadata: {json.dumps(self.metadata, ensure_ascii=False)}"
+        # Show roles filled for arrangement awareness
+        roles = [t.role for t in self.tracks]
+        missing_roles = [r for r in ["melody", "harmony", "bass", "rhythm"] if r not in roles]
+        if missing_roles:
+            context += f"\nRoles not yet filled: {', '.join(missing_roles)}"
 
         return context
 
@@ -174,12 +191,72 @@ You must communicate in English only.
 }
 ```
 
+**Before outputting your JSON, reason through these steps internally:**
+1. What is the user's musical intent? (mood, style, specific requests)
+2. Analyze current composition state — what roles are filled, what's the key/tempo?
+3. What's missing or needs improvement? (arrangement gaps, balance issues)
+4. What specific actions will achieve the user's goal?
+5. For each action's instruction: what exact register, density, rhythm, and articulation?
+Put your reasoning in the "reasoning" field of the JSON output. This step-by-step reasoning is critical for producing high-quality instructions.
+
+**Arrangement reference (use when planning instructions):**
+
+Register ranges by role (MIDI pitch numbers):
+  - Melody: C4-C6 (60-96), centered around middle register
+  - Harmony: C3-C5 (48-84), supporting register below melody
+  - Bass: E1-G3 (28-55), low foundation
+  - Rhythm/Drums: channel 10 (GM percussion)
+
+Target note density by role (notes/second):
+  - Melody: 2-6 (moderate, with phrasing rests)
+  - Harmony: 1-4 (sustained chords or arpeggios)
+  - Bass: 1-3 (steady, rhythmic foundation)
+  - Rhythm: 3-8 (consistent pulse)
+
+Common arrangement building order:
+  1. Start with melody (establishes key, tempo, mood)
+  2. Add bass (harmonic foundation)
+  3. Add harmony (fills, depth)
+  4. Add rhythm (groove, energy)
+
+**How to write effective MIDI-LLM instructions:**
+
+A good instruction includes ALL of these elements:
+1. Instrument constraint: "ONLY [instrument], no other instruments"
+2. Key and tempo: "in C major, 72 BPM"
+3. Register: "pitch range C4-C5 (MIDI 60-72)"
+4. Density target: "approximately 3 notes per second"
+5. Rhythmic feel: "quarter-note pulse with occasional eighth notes"
+6. Phrasing: "4-bar phrases with rests between phrases"
+7. Musical character: "lyrical, legato, gentle dynamics"
+
+Instruction template:
+"ONLY [instrument]. [Character description] in [key], [tempo] BPM. Register: [pitch range]. Density: ~[N] notes/sec. [Rhythmic description]. Use [N]-bar phrases with clear rests between phrases. Single [instrument] track only."
+
+**How to interpret current track features:**
+- note_density > 8: very dense (may need simplification)
+- note_density < 1: very sparse (may need more content)
+- pitch_range span < 12: narrow (one octave, may need more variety)
+- pitch_range span > 36: very wide (three octaves, may sound scattered)
+- silence_ratio > 0.3: significant gaps (may indicate generation issues)
+- in_key_ratio < 0.7: poor key conformance (regeneration recommended)
+- velocity_std < 5: flat dynamics (lacks expression)
+
+**Composition building strategy:**
+- First track: establish key, tempo, and mood. Be explicit about all parameters.
+- Second track: ALWAYS use reference_track_id pointing to first track. Specify complementary role.
+- Third+ tracks: reference the most relevant existing track. Fill missing arrangement roles.
+- Never create more than 2 tracks in a single turn (quality over quantity).
+
 **Guiding principles:**
 1. Prioritize user experience with clear, friendly English.
 2. Make musically sound decisions grounded in theory.
 3. Use gradual iteration: add or change a small number of tracks per turn.
 4. Be feature-driven: reference MIDI features, not vague guesses.
-5. Provide precise instructions to the MIDI-LLM.
+5. Provide precise instructions to the MIDI-LLM using the template above.
+6. **KEY/TEMPO CONSISTENCY IS CRITICAL**: When the composition has a detected key and tempo, ALL new tracks MUST specify the same key and tempo in their instructions (e.g., "in C major, 72 BPM"). This ensures harmonic and rhythmic alignment.
+7. **Always use reference_track_id** when creating tracks that should complement existing ones (bass, harmony, rhythm tracks). This passes musical context to MIDI-LLM for better alignment.
+8. **Instrument role balance**: Consider what roles are already filled when suggesting new tracks. A well-balanced composition needs melody, harmony, bass, and rhythm.
 
 **CRITICAL: Refinement Mode and Style Preservation:**
 
@@ -516,12 +593,14 @@ class GPTConductor:
         self,
         user_message: str,
         composition_state: Optional[CompositionState] = None,
+        conversation_history: Optional[list[dict]] = None,
     ) -> ConductorResponse:
         """Plan musical actions based on user message and current state.
 
         Args:
             user_message: User's natural language request
             composition_state: Current composition (tracks + metadata)
+            conversation_history: Recent conversation turns for context
 
         Returns:
             ConductorResponse with message + actions
@@ -529,10 +608,32 @@ class GPTConductor:
         # Build user message with context
         context = composition_state.to_context() if composition_state else "There are no tracks yet."
 
+        # Include composition-level key/tempo info
+        comp_info = ""
+        if composition_state and composition_state.metadata:
+            comp_key = composition_state.metadata.get("composition_key")
+            comp_tempo = composition_state.metadata.get("composition_tempo", 0)
+            if comp_key or comp_tempo:
+                parts = []
+                if comp_key:
+                    parts.append(f"Key: {comp_key[0]} {comp_key[1]}")
+                if comp_tempo > 0:
+                    parts.append(f"Tempo: {comp_tempo:.0f} BPM")
+                comp_info = f"\nComposition properties: {', '.join(parts)}"
+
+        # Include recent conversation history (last 5 turns)
+        history_text = ""
+        if conversation_history:
+            recent = conversation_history[-5:]
+            history_text = "\n\nRecent conversation:\n"
+            for turn in recent:
+                history_text += f"User: {turn['user']}\n"
+                history_text += f"You: {turn['conductor']}\n"
+
         user_prompt = f"""User message: {user_message}
 
 Current composition state:
-{context}
+{context}{comp_info}{history_text}
 
 Analyze the user's intent and the current state, then output your reply and action plan as JSON."""
 

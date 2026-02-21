@@ -3,7 +3,7 @@
 import io
 from collections import Counter
 from dataclasses import asdict, dataclass, field
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import pretty_midi
@@ -36,6 +36,19 @@ class MusicFeatures:
     has_excessive_notes: bool = False
     silence_ratio: float = 0.0
 
+    # Musical structure (from music_analysis)
+    estimated_key: Optional[tuple[str, str]] = None  # ("C", "major")
+    key_confidence: float = 0.0
+    estimated_tempo: float = 0.0  # BPM
+    chord_progression: list[str] = field(default_factory=list)
+
+    # Key conformance
+    in_key_ratio: float = 0.0  # Fraction of note durations on scale degrees of detected key
+
+    # Dynamics
+    velocity_mean: float = 0.0
+    velocity_std: float = 0.0
+
     def to_dict(self) -> dict:
         """Convert to JSON-serializable dict."""
         d = asdict(self)
@@ -45,6 +58,9 @@ class MusicFeatures:
         d["instrument_note_counts"] = {
             str(k): v for k, v in d["instrument_note_counts"].items()
         }
+        # Convert estimated_key tuple to list for JSON
+        if d.get("estimated_key") is not None:
+            d["estimated_key"] = list(d["estimated_key"])
         return d
 
 
@@ -116,6 +132,49 @@ class FeatureExtractor:
             int(inst.program) for inst in pm.instruments if not inst.is_drum
         )
 
+        # Music analysis: key, tempo, chords, velocity
+        from app.core.music_analysis import detect_key, detect_tempo, estimate_chords, get_velocity_stats
+
+        key_estimate = detect_key(pm)
+        estimated_key = None
+        key_confidence = 0.0
+        if key_estimate:
+            estimated_key = (key_estimate.key, key_estimate.mode)
+            key_confidence = key_estimate.confidence
+
+        estimated_tempo = detect_tempo(pm)
+
+        # Compute in-key ratio (fraction of note duration on scale degrees)
+        in_key_ratio = 0.0
+        if estimated_key and key_confidence > 0.3:
+            _MAJOR_SCALE = {0, 2, 4, 5, 7, 9, 11}
+            _MINOR_SCALE = {0, 2, 3, 5, 7, 8, 10}
+            key_name, mode = estimated_key
+            _pc_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+            root_pc = _pc_names.index(key_name) if key_name in _pc_names else 0
+            scale_pcs = _MAJOR_SCALE if mode == "major" else _MINOR_SCALE
+            # Shift scale degrees to the actual key root
+            scale_set = {(root_pc + d) % 12 for d in scale_pcs}
+
+            in_key_dur = 0.0
+            total_dur = 0.0
+            for inst in pm.instruments:
+                if inst.is_drum:
+                    continue
+                for note in inst.notes:
+                    dur = max(note.end - note.start, 0.01)
+                    total_dur += dur
+                    if note.pitch % 12 in scale_set:
+                        in_key_dur += dur
+
+            if total_dur > 0:
+                in_key_ratio = round(in_key_dur / total_dur, 3)
+
+        chord_estimates = estimate_chords(pm, window_seconds=self.window_seconds)
+        chord_progression = [c.name for c in chord_estimates]
+
+        velocity_mean, velocity_std = get_velocity_stats(pm)
+
         return MusicFeatures(
             note_density=round(note_density, 2),
             note_count=note_count,
@@ -128,6 +187,13 @@ class FeatureExtractor:
             instrument_note_counts=instrument_counts,
             has_excessive_notes=has_excessive,
             silence_ratio=round(silence_ratio, 3),
+            estimated_key=estimated_key,
+            key_confidence=key_confidence,
+            estimated_tempo=estimated_tempo,
+            chord_progression=chord_progression,
+            in_key_ratio=in_key_ratio,
+            velocity_mean=velocity_mean,
+            velocity_std=velocity_std,
         )
 
 

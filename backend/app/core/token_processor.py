@@ -11,6 +11,7 @@ from typing import Optional
 from anticipation.convert import events_to_midi
 
 from app.config import settings
+from app.core.midi_postprocessor import postprocess
 
 
 @dataclass
@@ -214,6 +215,15 @@ class TokenProcessor:
         import pretty_midi
 
         pm = pretty_midi.PrettyMIDI(io.BytesIO(midi_bytes))
+
+        # Post-process: quantize timing, normalize velocity, resolve overlaps
+        pm = postprocess(pm)
+
+        # Re-serialize after post-processing
+        buf = io.BytesIO()
+        pm.write(buf)
+        midi_bytes = buf.getvalue()
+
         duration = pm.get_end_time()
         instruments = sorted({int(inst.program) for inst in pm.instruments if not inst.is_drum})
         num_notes = sum(len(inst.notes) for inst in pm.instruments)
@@ -259,7 +269,7 @@ class TokenProcessor:
         pm = pretty_midi.PrettyMIDI(io.BytesIO(processed.midi_bytes))
         return MidiConversionResult(
             midi_bytes=processed.midi_bytes,
-            pretty_midi=pm,
+            pretty_midi=pm,  # Already post-processed in process()
             num_notes=processed.num_notes,
             duration_seconds=processed.duration_seconds,
         )

@@ -46,9 +46,13 @@ class Evaluator:
         self,
         accept_threshold: float = 0.65,
         reject_threshold: float = 0.35,
+        composition_key: tuple[str, str] | None = None,
+        composition_tempo: float = 0.0,
     ):
         self.accept_threshold = accept_threshold
         self.reject_threshold = reject_threshold
+        self.composition_key = composition_key
+        self.composition_tempo = composition_tempo
 
     def evaluate(
         self,
@@ -88,13 +92,25 @@ class Evaluator:
         quality_score = self._check_quality(features, strengths, weaknesses, suggestions)
         scores.append(quality_score)
 
-        # 4. Improvement over history (weight: low)
+        # 4. Key/tempo consistency (weight: normal)
+        coherence_score = self._check_coherence(features, strengths, weaknesses, suggestions)
+        scores.append(coherence_score)
+
+        # 5. Rhythmic regularity (weight: normal)
+        rhythm_score = self._check_rhythm(features, strengths, weaknesses, suggestions)
+        scores.append(rhythm_score)
+
+        # 6. Key conformance (weight: normal)
+        key_conf_score = self._check_key_conformance(features, strengths, weaknesses, suggestions)
+        scores.append(key_conf_score)
+
+        # 7. Improvement over history (weight: low)
         if history:
             improvement_score = self._check_improvement(features, history, strengths, weaknesses)
             scores.append(improvement_score * 0.5)
 
-        # Compute weighted average
-        total_score = sum(scores) / (5.5 if history else 5.0)
+        # Compute weighted average (validity*2 + intent*2 + quality + coherence + rhythm + key_conf = 8, +0.5 with history)
+        total_score = sum(scores) / (8.5 if history else 8.0)
         total_score = max(0.0, min(1.0, total_score))
 
         # Determine verdict
@@ -214,6 +230,146 @@ class Evaluator:
         if len(features.instruments_used) >= 2:
             score += 0.1
             strengths.append(f"Uses {len(features.instruments_used)} instruments")
+
+        return max(0.0, min(1.0, score))
+
+    def _check_coherence(
+        self, features: MusicFeatures, strengths, weaknesses, suggestions
+    ) -> float:
+        """Check key and tempo consistency with the composition."""
+        score = 0.5  # Neutral baseline
+
+        # Key consistency
+        if self.composition_key and features.estimated_key and features.key_confidence > 0.5:
+            comp_key, comp_mode = self.composition_key
+            track_key, track_mode = features.estimated_key
+
+            # Compatible keys: same key, or relative major/minor
+            _relative_map = {
+                "C": "A", "G": "E", "D": "B", "A": "F#", "E": "C#", "B": "G#",
+                "F": "D", "A#": "G", "D#": "C", "G#": "F", "C#": "A#", "F#": "D#",
+            }
+            is_same = (track_key == comp_key and track_mode == comp_mode)
+            is_relative = (
+                comp_mode == "major" and track_mode == "minor"
+                and _relative_map.get(comp_key) == track_key
+            ) or (
+                comp_mode == "minor" and track_mode == "major"
+                and _relative_map.get(track_key) == comp_key
+            )
+
+            if is_same:
+                score += 0.25
+                strengths.append(f"Key matches composition ({comp_key} {comp_mode})")
+            elif is_relative:
+                score += 0.15
+                strengths.append(f"Relative key to composition ({track_key} {track_mode})")
+            else:
+                score -= 0.2
+                weaknesses.append(
+                    f"Key mismatch: track={track_key} {track_mode}, "
+                    f"composition={comp_key} {comp_mode}"
+                )
+                suggestions.append(
+                    f"Regenerate in {comp_key} {comp_mode} to match composition"
+                )
+
+        # Tempo consistency (within 15% tolerance)
+        if self.composition_tempo > 0 and features.estimated_tempo > 0:
+            tempo_ratio = features.estimated_tempo / self.composition_tempo
+            if 0.85 <= tempo_ratio <= 1.15:
+                score += 0.2
+                strengths.append(f"Tempo consistent (~{features.estimated_tempo:.0f} BPM)")
+            elif 0.5 <= tempo_ratio <= 2.0:
+                # Could be half/double time - acceptable
+                score += 0.05
+            else:
+                score -= 0.15
+                weaknesses.append(
+                    f"Tempo mismatch: track~{features.estimated_tempo:.0f} BPM, "
+                    f"composition~{self.composition_tempo:.0f} BPM"
+                )
+                suggestions.append(
+                    f"Target tempo around {self.composition_tempo:.0f} BPM"
+                )
+
+        # Duration check - reasonable length
+        if features.duration_seconds >= 15.0:
+            score += 0.1
+        elif features.duration_seconds < 8.0:
+            score -= 0.1
+            weaknesses.append(f"Track too short ({features.duration_seconds:.1f}s)")
+            suggestions.append("Generate a longer piece (at least 15 seconds)")
+
+        return max(0.0, min(1.0, score))
+
+    def _check_rhythm(
+        self, features: MusicFeatures, strengths, weaknesses, suggestions
+    ) -> float:
+        """Check rhythmic regularity using onset density curve."""
+        score = 0.5  # Neutral baseline
+
+        curve = features.onset_density_curve
+        if not curve or len(curve) < 3:
+            return score
+
+        arr = [v for v in curve if v > 0]  # Non-silent windows only
+        if not arr:
+            return score
+
+        import numpy as np
+
+        arr_np = np.array(arr)
+        mean_val = arr_np.mean()
+
+        if mean_val < 0.01:
+            return score
+
+        cv = float(arr_np.std() / mean_val)  # Coefficient of variation
+
+        if cv < 0.5:
+            score += 0.15
+            strengths.append("Steady rhythmic pattern")
+        elif cv < 1.0:
+            score += 0.05
+        elif cv > 1.5:
+            score -= 0.10
+            weaknesses.append(f"Erratic rhythm (CV={cv:.2f})")
+            suggestions.append("Use more consistent rhythmic patterns")
+
+        # Check for empty windows in the middle (stuttering)
+        if len(curve) >= 4:
+            middle = curve[1:-1]  # Exclude first and last windows
+            empty_middle = sum(1 for d in middle if d == 0)
+            if empty_middle > len(middle) * 0.4:
+                score -= 0.1
+                weaknesses.append("Gaps in the middle of the piece")
+                suggestions.append("Fill rhythmic gaps for smoother continuity")
+
+        return max(0.0, min(1.0, score))
+
+    def _check_key_conformance(
+        self, features: MusicFeatures, strengths, weaknesses, suggestions
+    ) -> float:
+        """Check what fraction of notes conform to the detected key."""
+        score = 0.5  # Neutral baseline
+
+        if not features.estimated_key or features.key_confidence < 0.5:
+            return score  # Can't evaluate without a confident key
+
+        ratio = features.in_key_ratio
+
+        if ratio > 0.85:
+            score += 0.15
+            strengths.append(f"Strong key conformance ({ratio:.0%} in-key)")
+        elif ratio > 0.70:
+            score += 0.05
+        elif ratio < 0.50:
+            score -= 0.15
+            weaknesses.append(f"Poor key conformance ({ratio:.0%} in-key)")
+            suggestions.append(
+                f"Stay closer to {features.estimated_key[0]} {features.estimated_key[1]} scale"
+            )
 
         return max(0.0, min(1.0, score))
 

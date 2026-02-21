@@ -12,13 +12,18 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from app.agent.critic import GPTCritic
+from app.agent.evaluator import Evaluator
+from app.agent.planner import Planner
+from app.core.example_db import MIDIExampleDB
+from app.core.prompt_builder import PromptBuilder, GenerationPlan
 from app.conductors.gpt_conductor import GPTConductor, CompositionState
 from app.config import settings
 from app.core.audio_synthesis import AudioSynthesizer
-from app.core.feature_extractor import extract_features
+from app.core.feature_extractor import extract_features, MusicFeatures
 from app.core.token_processor import TokenProcessor
 from app.core.track_manager import TrackManager
-from app.musicians.midi_llm_musician import MIDILLMMusician
+from app.musicians.midi_llm_musician import MIDILLMMusician, MusicianGenerationResult
 
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -29,6 +34,7 @@ track_manager = TrackManager()
 conductor = None  # Lazy init to check API key
 token_processor = TokenProcessor()
 audio_synthesizer = None  # Lazy init to check soundfont
+example_db = MIDIExampleDB()  # Few-shot example retrieval database
 
 
 def get_conductor() -> GPTConductor:
@@ -110,11 +116,21 @@ async def chat(request: ChatRequest) -> ChatResponse:
     if not composition_state:
         raise HTTPException(status_code=404, detail="Composition not found")
 
+    # Build conversation history from session
+    session = track_manager.get_session(composition_id)
+    conversation_history = None
+    if session and session.user_messages:
+        conversation_history = [
+            {"user": u, "conductor": c}
+            for u, c in zip(session.user_messages, session.conductor_responses)
+        ]
+
     # Ask Conductor to plan actions
     conductor_instance = get_conductor()
     conductor_response = await conductor_instance.plan_action(
         user_message=request.message,
         composition_state=composition_state,
+        conversation_history=conversation_history,
     )
 
     # Execute actions
@@ -299,6 +315,270 @@ def _build_refinement_instruction(
     return template
 
 
+def _auto_select_reference(
+    composition_id: str,
+    new_role: str,
+    tm: TrackManager,
+) -> Optional[object]:
+    """Auto-select the best reference track for a new track based on role.
+
+    Role complementarity rules:
+    - bass -> reference melody track (follow harmonic progression)
+    - harmony -> reference melody track (complement melody)
+    - rhythm -> reference any track (sync tempo)
+    - melody -> reference harmony or bass track (fit with existing)
+
+    Args:
+        composition_id: Composition ID
+        new_role: Role of the new track being created
+        tm: TrackManager instance
+
+    Returns:
+        Best reference Track, or None if no tracks exist
+    """
+    state = tm.get_state(composition_id)
+    if not state or not state.tracks:
+        return None
+
+    # Priority order for reference by new role
+    role_priority = {
+        "bass": ["melody", "harmony", "rhythm"],
+        "harmony": ["melody", "bass", "rhythm"],
+        "rhythm": ["melody", "bass", "harmony"],
+        "melody": ["harmony", "bass", "rhythm"],
+    }
+
+    priorities = role_priority.get(new_role, ["melody", "harmony", "bass", "rhythm"])
+
+    for target_role in priorities:
+        for track in state.tracks:
+            if track.role == target_role and track.metadata.get("midi_token_ids"):
+                return track
+
+    # Fallback: return first track with tokens
+    for track in state.tracks:
+        if track.metadata.get("midi_token_ids"):
+            return track
+
+    return None
+
+
+async def _generate_with_quality_gate(
+    instruction: str,
+    user_intent: str,
+    musician: MIDILLMMusician,
+    role: str = "melody",
+    composition_key: tuple[str, str] | None = None,
+    composition_tempo: float = 0.0,
+    max_attempts: int = 3,
+    reference_tokens: list[int] | None = None,
+    reference_instrument: str | None = None,
+    reference_features: dict | None = None,
+    prefix_tokens: list[int] | None = None,
+    prefix_ratio: float = 0.3,
+    websocket: Optional[WebSocket] = None,
+) -> MusicianGenerationResult:
+    """Generate MIDI with automatic quality evaluation and retry.
+
+    Uses the Evaluator to score each generation attempt. If the score is below
+    the accept threshold, retries with enhanced instructions incorporating
+    evaluation feedback.
+
+    Args:
+        instruction: Generation instruction for MIDI-LLM
+        user_intent: Original user intent (for evaluation)
+        musician: MIDI-LLM musician instance
+        role: Track role (melody, harmony, bass, rhythm)
+        composition_key: Composition key for coherence evaluation
+        composition_tempo: Composition tempo for coherence evaluation
+        max_attempts: Maximum generation attempts
+        reference_tokens: Optional reference track tokens
+        reference_instrument: Optional reference instrument name
+        prefix_tokens: Optional prefix tokens for refinement
+        prefix_ratio: Prefix ratio for refinement
+        websocket: Optional WebSocket for debug messages
+
+    Returns:
+        Best MusicianGenerationResult from all attempts
+    """
+    evaluator = Evaluator(
+        accept_threshold=0.65,
+        reject_threshold=0.30,
+        composition_key=composition_key,
+        composition_tempo=composition_tempo,
+    )
+
+    # Initialize GPT critic for intelligent refinement feedback
+    gpt_critic = None
+    try:
+        if settings.openai_api_key:
+            gpt_critic = GPTCritic(api_key=settings.openai_api_key)
+    except Exception as e:
+        logger.warning(f"GPT critic unavailable, falling back to rule-based: {e}")
+
+    planner = Planner()
+    prompt_builder = PromptBuilder()
+    current_plan = planner.plan_initial(user_intent)
+
+    best_result = None
+    best_score = -1.0
+    current_instruction = instruction
+    history: list = []
+    prev_features = None  # Track features from failed attempts for adaptive constraints
+
+    # Retrieve few-shot examples for the first attempt (RAG)
+    example_context = ""
+    try:
+        # Extract key/tempo info for better matching
+        key_str = f"{composition_key[0]} {composition_key[1]}" if composition_key else ""
+        examples = example_db.query(
+            role=role,
+            instruction=instruction,
+            key=key_str,
+            tempo=composition_tempo,
+        )
+        if examples:
+            example_context = example_db.format_examples_for_prompt(examples)
+            logger.info(f"RAG: Retrieved {len(examples)} few-shot examples for {role}")
+    except Exception as e:
+        logger.warning(f"RAG example retrieval failed: {e}")
+
+    for attempt in range(1, max_attempts + 1):
+        # Generate (pass previous features for dynamic negative constraints on retries)
+        if reference_tokens:
+            result = await musician.generate_with_reference(
+                instruction=current_instruction,
+                reference_tokens=reference_tokens,
+                reference_instrument=reference_instrument,
+                reference_features=reference_features,
+                role=role,
+            )
+        elif prefix_tokens:
+            result = await musician.generate_with_prefix(
+                instruction=current_instruction,
+                prefix_tokens=prefix_tokens,
+                prefix_ratio=prefix_ratio,
+                role=role,
+            )
+        else:
+            result = await musician.generate(
+                current_instruction,
+                role=role,
+                previous_features=prev_features,
+                example_context=example_context if attempt == 1 else "",
+            )
+
+        # Evaluate
+        try:
+            midi_result = token_processor.tokens_to_midi(result.midi_token_ids)
+            features = extract_features(midi_result.pretty_midi)
+            evaluation = evaluator.evaluate(features, user_intent, history)
+
+            if evaluation.score > best_score:
+                best_score = evaluation.score
+                best_result = result
+
+            if websocket:
+                await websocket.send_json({
+                    "type": "debug",
+                    "data": {
+                        "message": (
+                            f"[Quality Gate] Attempt {attempt}/{max_attempts}: "
+                            f"score={evaluation.score:.2f}, verdict={evaluation.verdict}"
+                        ),
+                        "strengths": evaluation.strengths,
+                        "weaknesses": evaluation.weaknesses,
+                    },
+                })
+
+            if evaluation.verdict == "accept":
+                logger.info(
+                    f"Quality gate passed on attempt {attempt}: "
+                    f"score={evaluation.score:.3f}"
+                )
+                # Save successful generation to example DB for future RAG retrieval
+                try:
+                    key_str = ""
+                    if features.estimated_key:
+                        key_str = f"{features.estimated_key[0]} {features.estimated_key[1]}"
+                    example_db.add_example(
+                        token_ids=result.midi_token_ids,
+                        instruction=instruction,
+                        role=role,
+                        quality_score=evaluation.score,
+                        note_density=features.note_density,
+                        key=key_str,
+                        tempo=features.estimated_tempo,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to save example to DB: {e}")
+                return result
+
+            # Save features for adaptive constraints on next retry
+            prev_features = features
+
+            if attempt < max_attempts:
+                # Try GPT critic first for intelligent refinement feedback
+                critic_corrections = []
+                if gpt_critic and evaluation.verdict != "accept":
+                    try:
+                        critique = await gpt_critic.critique(
+                            features=features,
+                            user_intent=user_intent,
+                            role=role,
+                            attempt_number=attempt,
+                            composition_key=composition_key,
+                            composition_tempo=composition_tempo,
+                        )
+                        critic_corrections = critique.get("corrections", [])
+
+                        if websocket:
+                            await websocket.send_json({
+                                "type": "debug",
+                                "data": {
+                                    "message": (
+                                        f"[GPT Critic] {critique.get('diagnosis', '')}"
+                                    ),
+                                    "corrections": critic_corrections,
+                                    "critic_score": critique.get("quality_score", 0),
+                                },
+                            })
+                    except Exception as e:
+                        logger.warning(f"GPT critic failed on attempt {attempt}: {e}")
+
+                # Build refined instruction from critic corrections + evaluator suggestions
+                if critic_corrections:
+                    # GPT critic provides more specific feedback
+                    corrections_text = ". ".join(critic_corrections[:3])
+                    current_instruction = f"{instruction}\nIMPROVEMENTS REQUIRED: {corrections_text}"
+                    logger.info(
+                        f"Quality gate retry {attempt}: score={evaluation.score:.3f}, "
+                        f"critic corrections: {corrections_text[:100]}"
+                    )
+                elif evaluation.suggestions:
+                    # Fallback to rule-based refinement
+                    refined_plan = planner.plan_refinement(evaluation, current_plan, history)
+                    refined_prompt = prompt_builder.build_refinement(
+                        refined_plan,
+                        ". ".join(evaluation.suggestions[:3]),
+                    )
+                    current_instruction = f"{instruction}\n{refined_prompt}"
+                    current_plan = refined_plan
+                    logger.info(
+                        f"Quality gate retry {attempt}: score={evaluation.score:.3f}, "
+                        f"verdict={evaluation.verdict}, refined_prompt={refined_prompt[:100]}"
+                    )
+
+        except Exception as e:
+            logger.warning(f"Quality gate evaluation failed on attempt {attempt}: {e}")
+            if best_result is None:
+                best_result = result
+
+    # Return best attempt
+    logger.info(f"Quality gate: returning best of {max_attempts} attempts (score={best_score:.3f})")
+    return best_result or result
+
+
 async def _execute_create_track(
     composition_id: str,
     session_dir: Path,
@@ -321,18 +601,26 @@ async def _execute_create_track(
     reference_track_id = parameters.get("reference_track_id")  # Reference track
     volume = parameters.get("volume", 1.0)  # NEW: Track volume (0.0-1.0, default 1.0)
 
-    # NEW: Get reference track tokens if specified
+    # Get reference track tokens if specified, or auto-select best reference
     reference_tokens = None
     reference_track = None
     if reference_track_id:
         reference_track = track_manager.get_track(composition_id, reference_track_id)
+    elif track_manager.get_state(composition_id).tracks:
+        # Auto-select reference track based on role complementarity
+        reference_track = _auto_select_reference(
+            composition_id, role, track_manager
+        )
         if reference_track:
-            reference_tokens = reference_track.metadata.get("midi_token_ids", [])
-            if reference_tokens:
-                logger.info(
-                    f"Using reference track {reference_track_id} "
-                    f"({reference_track.instrument}) with {len(reference_tokens)} tokens"
-                )
+            logger.info(f"Auto-selected reference track: {reference_track.id} ({reference_track.instrument})")
+
+    if reference_track:
+        reference_tokens = reference_track.metadata.get("midi_token_ids", [])
+        if reference_tokens:
+            logger.info(
+                f"Using reference track {reference_track.id} "
+                f"({reference_track.instrument}) with {len(reference_tokens)} tokens"
+            )
 
     # Send debug message with MIDI-LLM prompt
     if websocket:
@@ -341,7 +629,7 @@ async def _execute_create_track(
             "prompt": instruction,
         }
         if reference_track:
-            debug_data["reference_track"] = f"{reference_track_id} ({reference_track.instrument})"
+            debug_data["reference_track"] = f"{reference_track.id} ({reference_track.instrument})"
             debug_data["reference_tokens"] = len(reference_tokens) if reference_tokens else 0
 
         await websocket.send_json({
@@ -349,27 +637,40 @@ async def _execute_create_track(
             "data": debug_data,
         })
 
-    # Generate MIDI tokens using MIDI-LLM
+    # Get composition-level key/tempo for quality evaluation
+    comp_state = track_manager.get_state(composition_id)
+    comp_key = comp_state.metadata.get("composition_key") if comp_state else None
+    comp_tempo = comp_state.metadata.get("composition_tempo", 0.0) if comp_state else 0.0
+
+    # Enforce key/tempo in the instruction for subsequent tracks
+    if comp_key or comp_tempo > 0:
+        key_tempo_suffix = []
+        if comp_key:
+            key_tempo_suffix.append(f"MUST be in {comp_key[0]} {comp_key[1]}")
+        if comp_tempo > 0:
+            key_tempo_suffix.append(f"tempo {comp_tempo:.0f} BPM")
+        instruction = f"{instruction}. {', '.join(key_tempo_suffix)}."
+
+    # Build reference features dict if reference track available
+    reference_features = None
+    if reference_track:
+        reference_features = reference_track.features.to_dict()
+
+    # Generate MIDI tokens with quality gate
     musician = MIDILLMMusician()
     try:
-        # NEW: Use generate_with_reference if reference tokens available
-        if reference_tokens and hasattr(musician, 'generate_with_reference'):
-            try:
-                logger.info(f"Generating with reference to {reference_track_id}")
-                result = await musician.generate_with_reference(
-                    instruction=instruction,
-                    reference_tokens=reference_tokens,
-                    reference_instrument=reference_track.instrument if reference_track else None,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Reference-based generation failed: {e}, "
-                    "falling back to normal generation"
-                )
-                result = await musician.generate(instruction)
-        else:
-            # Standard generation without reference
-            result = await musician.generate(instruction)
+        result = await _generate_with_quality_gate(
+            instruction=instruction,
+            user_intent=instruction,
+            musician=musician,
+            role=role,
+            composition_key=tuple(comp_key) if comp_key else None,
+            composition_tempo=comp_tempo,
+            reference_tokens=reference_tokens,
+            reference_instrument=reference_track.instrument if reference_track else None,
+            reference_features=reference_features,
+            websocket=websocket,
+        )
     finally:
         await musician.close()
 
@@ -410,6 +711,23 @@ async def _execute_create_track(
             "volume": volume,  # NEW: Track volume for mixing (0.0-1.0)
         },
     )
+
+    # Store composition-level key/tempo from the first track (or update if better confidence)
+    comp_state = track_manager.get_state(composition_id)
+    if comp_state and features.estimated_key:
+        existing_key = comp_state.metadata.get("composition_key")
+        existing_confidence = comp_state.metadata.get("composition_key_confidence", 0.0)
+        if not existing_key or features.key_confidence > existing_confidence:
+            track_manager.update_metadata(composition_id, {
+                "composition_key": list(features.estimated_key),
+                "composition_key_confidence": features.key_confidence,
+            })
+    if comp_state and features.estimated_tempo > 0:
+        existing_tempo = comp_state.metadata.get("composition_tempo", 0.0)
+        if existing_tempo == 0:
+            track_manager.update_metadata(composition_id, {
+                "composition_tempo": features.estimated_tempo,
+            })
 
 
 async def _execute_regenerate_track(
@@ -501,47 +819,41 @@ async def _execute_regenerate_track(
     # Combine context + instruction
     full_instruction = context_prefix + instruction
 
+    # Get composition-level key/tempo for quality evaluation
+    comp_state = track_manager.get_state(composition_id)
+    comp_key = comp_state.metadata.get("composition_key") if comp_state else None
+    comp_tempo = comp_state.metadata.get("composition_tempo", 0.0) if comp_state else 0.0
+
+    # Calculate prefix ratio for style preservation
+    prefix_ratio = 0.3
+    prefix_tokens_for_gate = None
+    if old_tokens and preserve_style:
+        if feature_change_magnitude < 0.2:
+            prefix_ratio = 0.6
+        elif feature_change_magnitude < 0.4:
+            prefix_ratio = 0.4
+        else:
+            prefix_ratio = 0.25
+        prefix_tokens_for_gate = old_tokens
+    else:
+        logger.info(
+            f"Full regeneration without token prefix "
+            f"(preserve_style={preserve_style}, change={feature_change_magnitude:.1%})"
+        )
+
     musician = MIDILLMMusician()
     try:
-        # Adaptive token prefix based on preserve_style and change magnitude
-        if old_tokens and preserve_style:
-            # Calculate adaptive prefix ratio based on change magnitude
-            # Large changes → smaller prefix ratio (less constraint)
-            # Small changes → larger prefix ratio (more preservation)
-            base_prefix_ratio = 0.5  # Default: use 50% of old tokens
-
-            if feature_change_magnitude < 0.2:  # Small change (<20%)
-                prefix_ratio = 0.6  # Use more of the old tokens
-            elif feature_change_magnitude < 0.4:  # Moderate change (20-40%)
-                prefix_ratio = 0.4  # Use less of the old tokens
-            else:  # Large change (>40% but <50%, otherwise preserve_style would be False)
-                prefix_ratio = 0.25  # Use minimal prefix for maximum flexibility
-
-            if hasattr(musician, 'generate_with_prefix'):
-                try:
-                    logger.info(
-                        f"Using token prefix continuation: {len(old_tokens)} tokens, "
-                        f"ratio={prefix_ratio:.1%} (change magnitude: {feature_change_magnitude:.1%})"
-                    )
-                    result = await musician.generate_with_prefix(
-                        instruction=full_instruction,
-                        prefix_tokens=old_tokens,
-                        prefix_ratio=prefix_ratio,
-                    )
-                except Exception as e:
-                    logger.warning(f"Prefix continuation failed: {e}, falling back to normal generation")
-                    result = await musician.generate(full_instruction)
-            else:
-                # Fallback if generate_with_prefix not available
-                logger.info("generate_with_prefix not available, using normal generation")
-                result = await musician.generate(full_instruction)
-        else:
-            # Full regeneration: no token prefix (large change or preserve_style=False)
-            logger.info(
-                f"Full regeneration without token prefix "
-                f"(preserve_style={preserve_style}, change={feature_change_magnitude:.1%})"
-            )
-            result = await musician.generate(full_instruction)
+        result = await _generate_with_quality_gate(
+            instruction=full_instruction,
+            user_intent=full_instruction,
+            musician=musician,
+            role=role,
+            composition_key=tuple(comp_key) if comp_key else None,
+            composition_tempo=comp_tempo,
+            prefix_tokens=prefix_tokens_for_gate,
+            prefix_ratio=prefix_ratio,
+            websocket=websocket,
+        )
     finally:
         await musician.close()
 
@@ -830,46 +1142,63 @@ def _apply_instrument_override(
         pretty.write(buf)
         return buf.getvalue(), pretty
 
-    # For non-drum instruments: MERGE all non-drum tracks into ONE
+    # For non-drum instruments: smart merge based on note distribution
     if target is not None:
         non_drum_instruments = [inst for inst in pretty.instruments if not inst.is_drum]
 
         if not non_drum_instruments:
-            # No non-drum tracks, create empty one
             merged = pretty_midi.Instrument(program=target, is_drum=False, name=instrument_name)
         elif len(non_drum_instruments) == 1:
-            # Only one track, just change program
             merged = non_drum_instruments[0]
             merged.program = target
             merged.name = instrument_name
         else:
-            # MULTIPLE TRACKS - MERGE THEM
-            merged = pretty_midi.Instrument(program=target, is_drum=False, name=instrument_name)
+            # Multiple tracks - check if one dominates
+            total_notes = sum(len(inst.notes) for inst in non_drum_instruments)
+            if total_notes == 0:
+                merged = pretty_midi.Instrument(program=target, is_drum=False, name=instrument_name)
+            else:
+                # Find instrument with most notes
+                main_inst = max(non_drum_instruments, key=lambda i: len(i.notes))
+                main_ratio = len(main_inst.notes) / total_notes
 
-            # Collect all notes from all non-drum tracks
-            all_notes = []
-            for inst in non_drum_instruments:
-                all_notes.extend(inst.notes)
+                if main_ratio > 0.80:
+                    # Main instrument dominates (>80%): just reassign program, drop others
+                    merged = main_inst
+                    merged.program = target
+                    merged.name = instrument_name
+                    logger.info(
+                        f"Instrument override: main instrument has {main_ratio:.0%} of notes, "
+                        f"dropping {len(non_drum_instruments) - 1} minor tracks"
+                    )
+                else:
+                    # Merge all tracks
+                    if main_ratio < 0.50:
+                        logger.warning(
+                            f"MIDI-LLM generated multi-instrument despite single-instrument instruction "
+                            f"(main has only {main_ratio:.0%} of notes)"
+                        )
+                    merged = pretty_midi.Instrument(program=target, is_drum=False, name=instrument_name)
 
-            # Sort by start time
-            all_notes.sort(key=lambda n: n.start)
+                    all_notes = []
+                    for inst in non_drum_instruments:
+                        all_notes.extend(inst.notes)
 
-            # Remove overlapping/duplicate notes (keep unique notes only)
-            unique_notes = []
-            for note in all_notes:
-                # Check if this note is too similar to existing notes
-                is_duplicate = False
-                for existing in unique_notes:
-                    # Same pitch, overlapping time → duplicate
-                    if (note.pitch == existing.pitch and
-                        abs(note.start - existing.start) < 0.05):  # Within 50ms
-                        is_duplicate = True
-                        break
+                    all_notes.sort(key=lambda n: n.start)
 
-                if not is_duplicate:
-                    unique_notes.append(note)
+                    # Deduplicate
+                    unique_notes = []
+                    for note in all_notes:
+                        is_duplicate = False
+                        for existing in unique_notes:
+                            if (note.pitch == existing.pitch and
+                                abs(note.start - existing.start) < 0.05):
+                                is_duplicate = True
+                                break
+                        if not is_duplicate:
+                            unique_notes.append(note)
 
-            merged.notes = unique_notes
+                    merged.notes = unique_notes
 
         # Replace all instruments with the single merged track
         pretty.instruments = [merged]
@@ -912,11 +1241,6 @@ def _infer_instrument(instrument: str, instruction: str) -> str:
     return "Piano"
 
 
-def _mix_url(composition_id: str, filename: str, version: int | None) -> str:
-    suffix = f"?v={version}" if version else ""
-    return f"/api/outputs/{composition_id}/{filename}{suffix}"
-
-
 async def _ensure_mix(
     composition_id: str,
     session_dir: Path,
@@ -949,12 +1273,13 @@ async def _ensure_mix(
 
     track_midi_paths = [Path(track.midi_path) for track in composition_state.tracks]
 
-    # NEW: Extract track volumes from metadata
+    # Extract track volumes and roles from metadata
     track_volumes = {}
+    track_roles = {}
     for track in composition_state.tracks:
         midi_filename = Path(track.midi_path).name
-        volume = track.metadata.get("volume", 1.0)  # Default to 1.0 (full volume)
-        track_volumes[midi_filename] = volume
+        track_volumes[midi_filename] = track.metadata.get("volume", 1.0)
+        track_roles[midi_filename] = track.role or "melody"
 
     synthesizer = get_audio_synthesizer()
     try:
@@ -962,7 +1287,8 @@ async def _ensure_mix(
             composition_id=composition_id,
             track_midi_paths=track_midi_paths,
             output_dir=session_dir,
-            track_volumes=track_volumes,  # NEW: Pass volumes
+            track_volumes=track_volumes,
+            track_roles=track_roles,
             format="mp3",
         )
     except Exception as e:
@@ -1041,10 +1367,20 @@ async def chat_ws(websocket: WebSocket):
                 "data": {"message": f"Received user message: {user_message}"},
             })
 
+            # Build conversation history from session
+            session = track_manager.get_session(composition_id)
+            conversation_history = None
+            if session and session.user_messages:
+                conversation_history = [
+                    {"user": u, "conductor": c}
+                    for u, c in zip(session.user_messages, session.conductor_responses)
+                ]
+
             conductor_instance = get_conductor()
             conductor_response = await conductor_instance.plan_action(
                 user_message=user_message,
                 composition_state=composition_state,
+                conversation_history=conversation_history,
             )
 
             # Send Conductor's message

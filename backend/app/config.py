@@ -13,10 +13,18 @@ class Settings(BaseSettings):
     ollama_timeout: float = 300.0
 
     # Generation defaults
-    default_temperature: float = 1.0
-    default_top_p: float = 0.98
+    default_temperature: float = 0.85
+    default_top_p: float = 0.92
     default_max_tokens: int = 2046
     max_iterations: int = 5
+
+    # Role-specific temperature overrides (lower = more coherent)
+    role_temperature: dict[str, float] = {
+        "melody": 0.88,
+        "harmony": 0.75,
+        "bass": 0.70,
+        "rhythm": 0.78,
+    }
 
     # Paths
     output_dir: str = "./outputs"
@@ -24,8 +32,21 @@ class Settings(BaseSettings):
 
     # MIDI-LLM
     system_prompt: str = (
-        "You are a world-class composer. "
-        "Please compose some music according to the following description: "
+        "You are a professional composer generating single-instrument MIDI music. "
+        "Rules: "
+        "1) Generate ONLY the one instrument requested — never add extra instruments. "
+        "2) Use clear phrase structure: organize notes into 4-bar or 8-bar phrases, "
+        "with brief rests between phrases for natural breathing. "
+        "3) Use melodic motifs: introduce a short melodic idea early and develop it "
+        "through repetition, transposition, or variation. "
+        "4) Match the specified key precisely — the majority of notes should be on "
+        "scale degrees of the requested key. "
+        "5) Match the specified tempo — use note durations that create the requested rhythmic feel. "
+        "6) Keep polyphony under 4 simultaneous notes. "
+        "7) Use dynamic variation — vary velocity for musical expression, avoid flat dynamics. "
+        "8) Avoid: random pitch sequences, excessively long notes with no movement, "
+        "dense clusters with no rhythmic pattern, or notes outside the specified register. "
+        "Compose music for: "
     )
 
     # CORS
