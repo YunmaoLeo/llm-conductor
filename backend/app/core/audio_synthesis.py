@@ -234,6 +234,7 @@ class AudioSynthesizer:
         track_id: str,
         midi_bytes: bytes,
         output_dir: Path,
+        target_duration_seconds: Optional[float] = None,
         format: str = "mp3",
     ) -> tuple[Path, Path]:
         """Synthesize a single track from MIDI bytes.
@@ -245,6 +246,8 @@ class AudioSynthesizer:
             track_id: Track identifier
             midi_bytes: MIDI file bytes
             output_dir: Output directory
+            target_duration_seconds: Optional fixed output audio duration in seconds.
+                If set, audio will be trimmed/padded to this duration.
             format: Audio format (mp3, wav, flac)
 
         Returns:
@@ -276,6 +279,28 @@ class AudioSynthesizer:
         # Convert to audio
         self.midi_to_audio(midi_path, audio_path, format=format)
 
+        # Normalize track audio length to composition target duration.
+        if target_duration_seconds and target_duration_seconds > 0:
+            from pydub import AudioSegment
+
+            target_ms = max(1, int(target_duration_seconds * 1000))
+            audio = AudioSegment.from_file(str(audio_path))
+
+            # Ignore tiny differences from encoder/synth rounding.
+            if abs(len(audio) - target_ms) > 20:
+                if len(audio) > target_ms:
+                    audio = audio[:target_ms]
+                else:
+                    audio += AudioSegment.silent(
+                        duration=target_ms - len(audio),
+                        frame_rate=audio.frame_rate,
+                    )
+
+                if format == "mp3":
+                    audio.export(str(audio_path), format="mp3", bitrate="192k")
+                else:
+                    audio.export(str(audio_path), format=format)
+
         return midi_path, audio_path
 
     def synthesize_mix(
@@ -285,6 +310,7 @@ class AudioSynthesizer:
         output_dir: Path,
         track_volumes: Optional[dict[str, float]] = None,
         track_roles: Optional[dict[str, str]] = None,
+        target_duration_seconds: Optional[float] = None,
         format: str = "mp3",
     ) -> tuple[Path, Path]:
         """Synthesize a mixed version of all tracks with mastering.
@@ -297,6 +323,8 @@ class AudioSynthesizer:
             output_dir: Output directory
             track_volumes: Dict mapping track filenames to volume (0.0-1.0)
             track_roles: Dict mapping track filenames to role (melody, harmony, bass, rhythm)
+            target_duration_seconds: Optional fixed mix duration in seconds. Each
+                rendered track will be trimmed/padded to this duration before overlay.
             format: Audio format
 
         Returns:
@@ -318,6 +346,11 @@ class AudioSynthesizer:
 
         # Render each track with role-aware settings
         track_audio_segments = []
+        target_ms = (
+            max(1, int(target_duration_seconds * 1000))
+            if target_duration_seconds and target_duration_seconds > 0
+            else None
+        )
         for midi_path in track_midi_paths:
             track_filename = midi_path.name
             role = track_roles.get(track_filename, "melody")
@@ -344,6 +377,16 @@ class AudioSynthesizer:
             if abs(pan) > 0.01 and audio.channels == 2:
                 audio = audio.pan(pan)
                 logger.debug(f"Track {track_filename} panned to {pan:+.1f}")
+
+            # Force same duration for all tracks in the mix.
+            if target_ms is not None and abs(len(audio) - target_ms) > 20:
+                if len(audio) > target_ms:
+                    audio = audio[:target_ms]
+                else:
+                    audio += AudioSegment.silent(
+                        duration=target_ms - len(audio),
+                        frame_rate=audio.frame_rate,
+                    )
 
             track_audio_segments.append(audio)
             wav_path.unlink()

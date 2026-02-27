@@ -363,6 +363,178 @@ def _auto_select_reference(
     return None
 
 
+def _resolve_target_duration_seconds(
+    composition_state: Optional[CompositionState],
+) -> float:
+    """Resolve composition target duration, with fallback for legacy sessions."""
+    if not composition_state:
+        return 0.0
+
+    target = float(composition_state.metadata.get("target_duration_seconds", 0.0) or 0.0)
+    if target > 0:
+        return target
+
+    for track in composition_state.tracks:
+        duration = float(getattr(track.features, "duration_seconds", 0.0) or 0.0)
+        if duration > 0:
+            return duration
+
+    return 0.0
+
+
+def _estimate_bar_count(duration_seconds: float, tempo_bpm: float) -> int:
+    """Estimate total bars from duration and tempo (assume 4/4)."""
+    if duration_seconds <= 0:
+        return 8
+    tempo = tempo_bpm if tempo_bpm > 0 else 90.0
+    seconds_per_bar = (60.0 / tempo) * 4.0
+    if seconds_per_bar <= 0:
+        return 8
+    bars = int(round(duration_seconds / seconds_per_bar))
+    return max(4, bars)
+
+
+def _default_form_from_bars(bar_total: int) -> str:
+    """Generate a simple section form string from total bars."""
+    if bar_total <= 8:
+        return f"A{bar_total}"
+    if bar_total <= 16:
+        return "A8 A8"
+    if bar_total <= 24:
+        return "A8 B8 A8"
+    return "A8 A8 B8 A8"
+
+
+def _build_arrangement_contract(
+    composition_state: Optional[CompositionState],
+    reference_track: Optional[object] = None,
+) -> dict:
+    """Build a composition-level arrangement contract for all tracks."""
+    if composition_state and composition_state.metadata:
+        meta = composition_state.metadata
+    else:
+        meta = {}
+
+    comp_key = meta.get("composition_key")
+    key_name = "C major"
+    if comp_key and isinstance(comp_key, (list, tuple)) and len(comp_key) == 2:
+        key_name = f"{comp_key[0]} {comp_key[1]}"
+
+    tempo = float(meta.get("composition_tempo", 0.0) or 0.0)
+    if tempo <= 0:
+        tempo = 90.0
+
+    target_duration = float(meta.get("target_duration_seconds", 0.0) or 0.0)
+    if target_duration <= 0 and composition_state:
+        target_duration = _resolve_target_duration_seconds(composition_state)
+
+    bar_total = _estimate_bar_count(target_duration, tempo)
+
+    chord_source = None
+    if reference_track and getattr(reference_track, "features", None):
+        chord_source = reference_track.features.chord_progression
+    elif composition_state:
+        for t in composition_state.tracks:
+            if t.features and t.features.chord_progression:
+                chord_source = t.features.chord_progression
+                break
+
+    if chord_source:
+        chord_map = " | ".join(chord_source[: min(8, len(chord_source))])
+    else:
+        chord_map = "Use diatonic progression matching the detected key"
+
+    return {
+        "key": key_name,
+        "bpm": int(round(tempo)),
+        "time_signature": "4/4",
+        "bars": bar_total,
+        "form": _default_form_from_bars(bar_total),
+        "chord_map": chord_map,
+        "energy_curve": "low -> medium -> high -> resolve",
+    }
+
+
+def _render_structured_instruction(
+    *,
+    instruction_spec: dict,
+    fallback_instruction: str,
+    instrument: str,
+    role: str,
+    arrangement_contract: dict,
+    reference_track: Optional[object] = None,
+) -> str:
+    """Render structured instruction_spec into a deterministic musician prompt."""
+    global_spec = instruction_spec.get("global_contract", {}) if isinstance(instruction_spec, dict) else {}
+    track_spec = instruction_spec.get("track_role", {}) if isinstance(instruction_spec, dict) else {}
+    relation_spec = instruction_spec.get("relation_to_reference", {}) if isinstance(instruction_spec, dict) else {}
+    rhythm_spec = instruction_spec.get("rhythm_phrase_rules", {}) if isinstance(instruction_spec, dict) else {}
+    output_rules = instruction_spec.get("output_rules", []) if isinstance(instruction_spec, dict) else []
+
+    key_name = global_spec.get("key") or arrangement_contract["key"]
+    bpm = int(global_spec.get("bpm") or arrangement_contract["bpm"])
+    time_sig = global_spec.get("time_signature") or arrangement_contract["time_signature"]
+    form = global_spec.get("form") or arrangement_contract["form"]
+    bars = int(global_spec.get("bars") or arrangement_contract["bars"])
+    chord_map = global_spec.get("chord_map") or arrangement_contract["chord_map"]
+    energy_curve = global_spec.get("energy_curve") or arrangement_contract["energy_curve"]
+
+    bar_start = int(track_spec.get("bar_start", 1))
+    bar_end = int(track_spec.get("bar_end", bars))
+    register_low = int(track_spec.get("register_low", 48))
+    register_high = int(track_spec.get("register_high", 84))
+    density_target = track_spec.get("density_target", "role-appropriate")
+    function_in_mix = track_spec.get("function_in_mix", role)
+    interaction_type = relation_spec.get("interaction_type", "complement")
+
+    if reference_track:
+        ref_id = getattr(reference_track, "id", "")
+        ref_inst = getattr(reference_track, "instrument", "unknown")
+        ref_desc = f"{ref_id} ({ref_inst})"
+    else:
+        ref_desc = relation_spec.get("reference_track_id", "none")
+
+    phrase_len = rhythm_spec.get("phrase_length_bars", 4)
+    anchor_beats = rhythm_spec.get("anchor_beats", "1 and 3")
+    cadence_bars = rhythm_spec.get("cadence_bars", "end of each phrase")
+
+    creative_intent = (
+        instruction_spec.get("creative_intent")
+        or fallback_instruction
+        or f"Compose a {role} line that supports the arrangement."
+    )
+
+    rules = [
+        "Single-instrument only",
+        "Strictly follow key/chords/form",
+        "Avoid register collision with reference when active",
+    ]
+    if isinstance(output_rules, list):
+        for r in output_rules:
+            if isinstance(r, str) and r.strip():
+                rules.append(r.strip())
+
+    return (
+        f"[GLOBAL CONTRACT]\n"
+        f"Key={key_name}, BPM={bpm}, TimeSig={time_sig}, Form={form}, Bars={bars}\n"
+        f"Chord map: {chord_map}\n"
+        f"Energy curve: {energy_curve}\n\n"
+        f"[TRACK ROLE]\n"
+        f"Instrument={instrument}, Role={role}, Bars={bar_start}-{bar_end}\n"
+        f"Register={register_low}-{register_high}, Density={density_target} notes/sec\n"
+        f"Function={function_in_mix}\n\n"
+        f"[RELATION TO REFERENCE]\n"
+        f"Reference={ref_desc}, Interaction={interaction_type}\n"
+        f"Complement the reference; do not duplicate melodic contour or octave placement.\n\n"
+        f"[RHYTHM AND PHRASE RULES]\n"
+        f"Phrase length={phrase_len} bars, Anchors={anchor_beats}, Cadence={cadence_bars}\n\n"
+        f"[CREATIVE INTENT]\n"
+        f"{creative_intent}\n\n"
+        f"[OUTPUT RULES]\n"
+        f"{'; '.join(rules)}.\n"
+    )
+
+
 async def _generate_with_quality_gate(
     instruction: str,
     user_intent: str,
@@ -377,6 +549,7 @@ async def _generate_with_quality_gate(
     prefix_tokens: list[int] | None = None,
     prefix_ratio: float = 0.3,
     websocket: Optional[WebSocket] = None,
+    target_instrument: str | None = None,
 ) -> MusicianGenerationResult:
     """Generate MIDI with automatic quality evaluation and retry.
 
@@ -468,10 +641,14 @@ async def _generate_with_quality_gate(
                 example_context=example_context if attempt == 1 else "",
             )
 
-        # Evaluate
+        # Evaluate (apply instrument override BEFORE feature extraction
+        # so quality gate sees the actual final output, not pre-override drums)
         try:
             midi_result = token_processor.tokens_to_midi(result.midi_token_ids)
-            features = extract_features(midi_result.pretty_midi)
+            eval_pretty = midi_result.pretty_midi
+            if target_instrument:
+                _, eval_pretty = _apply_instrument_override(eval_pretty, target_instrument)
+            features = extract_features(eval_pretty)
             evaluation = evaluator.evaluate(features, user_intent, history)
 
             if evaluation.score > best_score:
@@ -598,6 +775,7 @@ async def _execute_create_track(
     )
     role = parameters.get("role", "melody")
     instruction = parameters.get("instruction", "")
+    instruction_spec = parameters.get("instruction_spec")
     reference_track_id = parameters.get("reference_track_id")  # Reference track
     volume = parameters.get("volume", 1.0)  # NEW: Track volume (0.0-1.0, default 1.0)
 
@@ -621,8 +799,74 @@ async def _execute_create_track(
                 f"Using reference track {reference_track.id} "
                 f"({reference_track.instrument}) with {len(reference_tokens)} tokens"
             )
+        else:
+            logger.info(
+                f"Reference track {reference_track.id} found but no tokens available; "
+                "using text-only reference guidance"
+            )
 
-    # Send debug message with MIDI-LLM prompt
+    # Get composition-level key/tempo for quality evaluation
+    comp_state = track_manager.get_state(composition_id)
+    comp_key = comp_state.metadata.get("composition_key") if comp_state else None
+    comp_tempo = comp_state.metadata.get("composition_tempo", 0.0) if comp_state else 0.0
+    target_duration_seconds = _resolve_target_duration_seconds(comp_state)
+    if (
+        comp_state
+        and target_duration_seconds > 0
+        and float(comp_state.metadata.get("target_duration_seconds", 0.0) or 0.0) <= 0
+    ):
+        track_manager.update_metadata(composition_id, {
+            "target_duration_seconds": round(target_duration_seconds, 2),
+        })
+
+    # Render structured prompt contract if provided by Conductor.
+    if isinstance(instruction_spec, dict):
+        arrangement_contract = _build_arrangement_contract(
+            composition_state=comp_state,
+            reference_track=reference_track,
+        )
+        instruction = _render_structured_instruction(
+            instruction_spec=instruction_spec,
+            fallback_instruction=instruction,
+            instrument=instrument,
+            role=role,
+            arrangement_contract=arrangement_contract,
+            reference_track=reference_track,
+        )
+
+    # Enforce key/tempo in the instruction for subsequent tracks
+    if (not isinstance(instruction_spec, dict)) and (comp_key or comp_tempo > 0):
+        key_tempo_suffix = []
+        if comp_key:
+            key_tempo_suffix.append(f"MUST be in {comp_key[0]} {comp_key[1]}")
+        if comp_tempo > 0:
+            key_tempo_suffix.append(f"tempo {comp_tempo:.0f} BPM")
+        instruction = f"{instruction}. {', '.join(key_tempo_suffix)}."
+
+    # Fallback: keep reference relation in prompt even when reference tokens are unavailable.
+    if reference_track and not reference_tokens:
+        ref_features = reference_track.features
+        key_line = (
+            f"Key={ref_features.estimated_key[0]} {ref_features.estimated_key[1]}. "
+            if ref_features.estimated_key else ""
+        )
+        tempo_line = (
+            f"Tempo={ref_features.estimated_tempo:.0f} BPM. "
+            if ref_features.estimated_tempo > 0 else ""
+        )
+        chord_line = (
+            f"Chords={' | '.join(ref_features.chord_progression[:8])}. "
+            if ref_features.chord_progression else ""
+        )
+        instruction = (
+            "[REFERENCE TRACK CONTEXT]\n"
+            f"Reference={reference_track.id} ({reference_track.instrument}, {reference_track.role}). "
+            f"{key_line}{tempo_line}{chord_line}"
+            "Match harmonic rhythm and phrase boundaries; complement and avoid duplicate contour.\n\n"
+            f"{instruction}"
+        )
+
+    # Send debug message with the final rendered instruction.
     if websocket:
         debug_data = {
             "message": f"[MIDI-LLM] Generating {instrument} ({role})",
@@ -631,25 +875,14 @@ async def _execute_create_track(
         if reference_track:
             debug_data["reference_track"] = f"{reference_track.id} ({reference_track.instrument})"
             debug_data["reference_tokens"] = len(reference_tokens) if reference_tokens else 0
+            debug_data["reference_mode"] = "tokens" if reference_tokens else "text_fallback"
+        if isinstance(instruction_spec, dict):
+            debug_data["prompt_mode"] = "structured_contract"
 
         await websocket.send_json({
             "type": "debug",
             "data": debug_data,
         })
-
-    # Get composition-level key/tempo for quality evaluation
-    comp_state = track_manager.get_state(composition_id)
-    comp_key = comp_state.metadata.get("composition_key") if comp_state else None
-    comp_tempo = comp_state.metadata.get("composition_tempo", 0.0) if comp_state else 0.0
-
-    # Enforce key/tempo in the instruction for subsequent tracks
-    if comp_key or comp_tempo > 0:
-        key_tempo_suffix = []
-        if comp_key:
-            key_tempo_suffix.append(f"MUST be in {comp_key[0]} {comp_key[1]}")
-        if comp_tempo > 0:
-            key_tempo_suffix.append(f"tempo {comp_tempo:.0f} BPM")
-        instruction = f"{instruction}. {', '.join(key_tempo_suffix)}."
 
     # Build reference features dict if reference track available
     reference_features = None
@@ -670,6 +903,7 @@ async def _execute_create_track(
             reference_instrument=reference_track.instrument if reference_track else None,
             reference_features=reference_features,
             websocket=websocket,
+            target_instrument=instrument,
         )
     finally:
         await musician.close()
@@ -679,6 +913,9 @@ async def _execute_create_track(
     midi_bytes, pretty = _apply_instrument_override(
         midi_result.pretty_midi, instrument
     )
+    midi_bytes, pretty = _normalize_midi_start_time(pretty)
+    if target_duration_seconds and target_duration_seconds > 0:
+        midi_bytes, pretty = _trim_midi_to_duration(pretty, target_duration_seconds)
 
     # Synthesize audio
     track_id = f"track_{len(track_manager.get_state(composition_id).tracks) + 1}"
@@ -687,6 +924,7 @@ async def _execute_create_track(
         track_id=track_id,
         midi_bytes=midi_bytes,
         output_dir=session_dir,
+        target_duration_seconds=target_duration_seconds if target_duration_seconds > 0 else None,
         format="mp3",
     )
 
@@ -708,6 +946,7 @@ async def _execute_create_track(
             "generation_time_ms": result.generation_time_ms,
             "midi_token_ids": result.midi_token_ids,  # Save tokens for future refinement
             "refinement_history": [],  # Track refinement chain
+            "instruction_spec": instruction_spec if isinstance(instruction_spec, dict) else None,
             "volume": volume,  # NEW: Track volume for mixing (0.0-1.0)
         },
     )
@@ -728,6 +967,13 @@ async def _execute_create_track(
             track_manager.update_metadata(composition_id, {
                 "composition_tempo": features.estimated_tempo,
             })
+    # Set composition target duration from the first successful track.
+    if comp_state:
+        existing_target = comp_state.metadata.get("target_duration_seconds", 0.0)
+        if existing_target <= 0 and features.duration_seconds > 0:
+            track_manager.update_metadata(composition_id, {
+                "target_duration_seconds": round(features.duration_seconds, 2),
+            })
 
 
 async def _execute_regenerate_track(
@@ -742,6 +988,7 @@ async def _execute_regenerate_track(
         return
 
     instruction = parameters.get("instruction", "")
+    instruction_spec = parameters.get("instruction_spec")
     existing = track_manager.get_track(composition_id, track_id)
     if not existing:
         return
@@ -770,25 +1017,34 @@ async def _execute_regenerate_track(
         preserve_style = False
         logger.info(f"Large feature change detected ({feature_change_magnitude:.1%}), disabling token prefix")
 
-    # Send debug message with MIDI-LLM prompt and refinement mode
-    if websocket:
-        mode_label = {
-            "full_regen": "Full Regeneration",
-            "refinement": "Refinement (with token prefix)",
-            "variation": "Variation (partial preservation)",
-            "rewrite": "Complete Rewrite",
-        }.get(refinement_mode, refinement_mode)
-
-        await websocket.send_json({
-            "type": "debug",
-            "data": {
-                "message": f"[MIDI-LLM] {mode_label}: {track_id} ({instrument})",
-                "prompt": instruction,
-                "refinement_mode": refinement_mode,
-                "preserve_style": preserve_style,
-                "feature_change": f"{feature_change_magnitude:.1%}",
-            },
+    # Get composition-level key/tempo for quality evaluation
+    comp_state = track_manager.get_state(composition_id)
+    comp_key = comp_state.metadata.get("composition_key") if comp_state else None
+    comp_tempo = comp_state.metadata.get("composition_tempo", 0.0) if comp_state else 0.0
+    target_duration_seconds = _resolve_target_duration_seconds(comp_state)
+    if (
+        comp_state
+        and target_duration_seconds > 0
+        and float(comp_state.metadata.get("target_duration_seconds", 0.0) or 0.0) <= 0
+    ):
+        track_manager.update_metadata(composition_id, {
+            "target_duration_seconds": round(target_duration_seconds, 2),
         })
+
+    # Render structured prompt contract if provided by Conductor.
+    if isinstance(instruction_spec, dict):
+        arrangement_contract = _build_arrangement_contract(
+            composition_state=comp_state,
+            reference_track=existing,
+        )
+        instruction = _render_structured_instruction(
+            instruction_spec=instruction_spec,
+            fallback_instruction=instruction,
+            instrument=instrument,
+            role=role,
+            arrangement_contract=arrangement_contract,
+            reference_track=existing,
+        )
 
     # Enhance instruction based on refinement mode and preserve_style flag
     if existing and preserve_style:
@@ -819,10 +1075,26 @@ async def _execute_regenerate_track(
     # Combine context + instruction
     full_instruction = context_prefix + instruction
 
-    # Get composition-level key/tempo for quality evaluation
-    comp_state = track_manager.get_state(composition_id)
-    comp_key = comp_state.metadata.get("composition_key") if comp_state else None
-    comp_tempo = comp_state.metadata.get("composition_tempo", 0.0) if comp_state else 0.0
+    # Send debug message with final prompt and refinement mode.
+    if websocket:
+        mode_label = {
+            "full_regen": "Full Regeneration",
+            "refinement": "Refinement (with token prefix)",
+            "variation": "Variation (partial preservation)",
+            "rewrite": "Complete Rewrite",
+        }.get(refinement_mode, refinement_mode)
+
+        await websocket.send_json({
+            "type": "debug",
+            "data": {
+                "message": f"[MIDI-LLM] {mode_label}: {track_id} ({instrument})",
+                "prompt": full_instruction,
+                "refinement_mode": refinement_mode,
+                "preserve_style": preserve_style,
+                "feature_change": f"{feature_change_magnitude:.1%}",
+                "prompt_mode": "structured_contract" if isinstance(instruction_spec, dict) else "legacy_instruction",
+            },
+        })
 
     # Calculate prefix ratio for style preservation
     prefix_ratio = 0.3
@@ -853,6 +1125,7 @@ async def _execute_regenerate_track(
             prefix_tokens=prefix_tokens_for_gate,
             prefix_ratio=prefix_ratio,
             websocket=websocket,
+            target_instrument=instrument,
         )
     finally:
         await musician.close()
@@ -861,12 +1134,16 @@ async def _execute_regenerate_track(
     midi_bytes, pretty = _apply_instrument_override(
         midi_result.pretty_midi, instrument
     )
+    midi_bytes, pretty = _normalize_midi_start_time(pretty)
+    if target_duration_seconds and target_duration_seconds > 0:
+        midi_bytes, pretty = _trim_midi_to_duration(pretty, target_duration_seconds)
 
     synthesizer = get_audio_synthesizer()
     midi_path, audio_path = synthesizer.synthesize_track(
         track_id=track_id,
         midi_bytes=midi_bytes,
         output_dir=session_dir,
+        target_duration_seconds=target_duration_seconds if target_duration_seconds > 0 else None,
         format="mp3",
     )
 
@@ -893,6 +1170,7 @@ async def _execute_regenerate_track(
                 "instruction": old_instruction,
                 "token_count": len(old_tokens),
             }] if old_tokens else existing.metadata.get("refinement_history", []),
+            "instruction_spec": instruction_spec if isinstance(instruction_spec, dict) else existing.metadata.get("instruction_spec"),
             "volume": volume,  # NEW: Track volume for mixing
         },
     )
@@ -940,6 +1218,7 @@ async def _execute_modify_track(
             parameters={
                 "track_id": track_id,
                 "instruction": instruction,
+                "instruction_spec": instruction_spec,
                 "instrument": instrument,
                 "role": role,
             },
@@ -1145,8 +1424,24 @@ def _apply_instrument_override(
     # For non-drum instruments: smart merge based on note distribution
     if target is not None:
         non_drum_instruments = [inst for inst in pretty.instruments if not inst.is_drum]
+        drum_instruments = [inst for inst in pretty.instruments if inst.is_drum]
 
-        if not non_drum_instruments:
+        if not non_drum_instruments and drum_instruments:
+            # ALL notes are on drum channel — remap to target instrument.
+            # This happens when MIDI-LLM generates drum-instrument tokens
+            # (instrument 128 in AMT space) instead of the requested instrument.
+            # The pitch values are still valid MIDI pitches, just on the wrong channel.
+            logger.warning(
+                f"All generated notes are on drum channel, remapping "
+                f"{sum(len(d.notes) for d in drum_instruments)} notes to "
+                f"{instrument_name} (program {target})"
+            )
+            merged = pretty_midi.Instrument(program=target, is_drum=False, name=instrument_name)
+            for drum_inst in drum_instruments:
+                for note in drum_inst.notes:
+                    merged.notes.append(note)
+            merged.notes.sort(key=lambda n: n.start)
+        elif not non_drum_instruments:
             merged = pretty_midi.Instrument(program=target, is_drum=False, name=instrument_name)
         elif len(non_drum_instruments) == 1:
             merged = non_drum_instruments[0]
@@ -1202,6 +1497,83 @@ def _apply_instrument_override(
 
         # Replace all instruments with the single merged track
         pretty.instruments = [merged]
+
+    buf = io.BytesIO()
+    pretty.write(buf)
+    return buf.getvalue(), pretty
+
+
+def _trim_midi_to_duration(
+    pretty: "pretty_midi.PrettyMIDI",
+    target_duration_seconds: float,
+) -> tuple[bytes, "pretty_midi.PrettyMIDI"]:
+    """Trim MIDI events that exceed the target duration.
+
+    This keeps track lengths consistent across a composition once a target
+    duration is established.
+    """
+    if target_duration_seconds <= 0:
+        buf = io.BytesIO()
+        pretty.write(buf)
+        return buf.getvalue(), pretty
+
+    min_note_len = 0.02
+    for inst in pretty.instruments:
+        kept_notes = []
+        for note in inst.notes:
+            if note.start >= target_duration_seconds:
+                continue
+            note.end = min(note.end, target_duration_seconds)
+            if note.end - note.start >= min_note_len:
+                kept_notes.append(note)
+        inst.notes = kept_notes
+        inst.control_changes = [
+            cc for cc in inst.control_changes if cc.time <= target_duration_seconds
+        ]
+        inst.pitch_bends = [
+            pb for pb in inst.pitch_bends if pb.time <= target_duration_seconds
+        ]
+
+    buf = io.BytesIO()
+    pretty.write(buf)
+    return buf.getvalue(), pretty
+
+
+def _normalize_midi_start_time(
+    pretty: "pretty_midi.PrettyMIDI",
+    keep_preroll_seconds: float = 0.05,
+    min_shift_threshold_seconds: float = 0.20,
+) -> tuple[bytes, "pretty_midi.PrettyMIDI"]:
+    """Shift MIDI events left if the first note starts too late.
+
+    This avoids tracks that are silent for the first half and only start later.
+    """
+    note_starts = [
+        n.start
+        for inst in pretty.instruments
+        for n in inst.notes
+    ]
+    if not note_starts:
+        buf = io.BytesIO()
+        pretty.write(buf)
+        return buf.getvalue(), pretty
+
+    first_start = min(note_starts)
+    if first_start < min_shift_threshold_seconds:
+        buf = io.BytesIO()
+        pretty.write(buf)
+        return buf.getvalue(), pretty
+
+    shift = max(0.0, first_start - max(0.0, keep_preroll_seconds))
+
+    for inst in pretty.instruments:
+        for note in inst.notes:
+            note.start = max(0.0, note.start - shift)
+            note.end = max(note.start + 0.01, note.end - shift)
+        for cc in inst.control_changes:
+            cc.time = max(0.0, cc.time - shift)
+        for pb in inst.pitch_bends:
+            pb.time = max(0.0, pb.time - shift)
 
     buf = io.BytesIO()
     pretty.write(buf)
@@ -1282,6 +1654,14 @@ async def _ensure_mix(
         track_roles[midi_filename] = track.role or "melody"
 
     synthesizer = get_audio_synthesizer()
+    target_duration_seconds = _resolve_target_duration_seconds(composition_state)
+    if (
+        target_duration_seconds > 0
+        and float(composition_state.metadata.get("target_duration_seconds", 0.0) or 0.0) <= 0
+    ):
+        track_manager.update_metadata(composition_id, {
+            "target_duration_seconds": round(target_duration_seconds, 2),
+        })
     try:
         combined_midi, mixed_audio = synthesizer.synthesize_mix(
             composition_id=composition_id,
@@ -1289,6 +1669,7 @@ async def _ensure_mix(
             output_dir=session_dir,
             track_volumes=track_volumes,
             track_roles=track_roles,
+            target_duration_seconds=target_duration_seconds if target_duration_seconds > 0 else None,
             format="mp3",
         )
     except Exception as e:

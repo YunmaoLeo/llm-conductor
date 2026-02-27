@@ -180,6 +180,36 @@ You must communicate in English only.
         "instrument": "Piano | Drums | Bass | Strings | Guitar ...",
         "role": "melody | harmony | rhythm | bass",
         "instruction": "Detailed English prompt for the MIDI-LLM (style, tempo, feel, key, texture)",
+        "instruction_spec": {
+          "global_contract": {
+            "key": "C major",
+            "bpm": 90,
+            "time_signature": "4/4",
+            "bars": 16,
+            "form": "A8 A8",
+            "chord_map": "C | Am | F | G ...",
+            "energy_curve": "low -> medium -> high -> resolve"
+          },
+          "track_role": {
+            "bar_start": 1,
+            "bar_end": 16,
+            "register_low": 48,
+            "register_high": 84,
+            "density_target": 3.0,
+            "function_in_mix": "support melody"
+          },
+          "relation_to_reference": {
+            "reference_track_id": "track_1",
+            "interaction_type": "complement | call_response | counterline | unison"
+          },
+          "rhythm_phrase_rules": {
+            "phrase_length_bars": 4,
+            "anchor_beats": "1 and 3",
+            "cadence_bars": "4, 8, 12, 16"
+          },
+          "output_rules": ["Single-instrument only", "Avoid register collision"],
+          "creative_intent": "Natural language musical intention"
+        },
         "refinement_mode": "refinement | variation | rewrite (default: refinement)",
         "preserve_style": "true | false (default: true) - set to false for drastic changes",
         "reference_track_id": "track_1 | track_2 | ... (optional) - for create_track, reference track to match/complement",
@@ -257,6 +287,15 @@ Instruction template:
 6. **KEY/TEMPO CONSISTENCY IS CRITICAL**: When the composition has a detected key and tempo, ALL new tracks MUST specify the same key and tempo in their instructions (e.g., "in C major, 72 BPM"). This ensures harmonic and rhythmic alignment.
 7. **Always use reference_track_id** when creating tracks that should complement existing ones (bass, harmony, rhythm tracks). This passes musical context to MIDI-LLM for better alignment.
 8. **Instrument role balance**: Consider what roles are already filled when suggesting new tracks. A well-balanced composition needs melody, harmony, bass, and rhythm.
+
+**CRITICAL: Structured Prompt Contract (must use)**
+- Always populate `parameters.instruction_spec` for create/regenerate/modify actions.
+- `instruction_spec` is the source of truth for cross-track cohesion:
+  - `global_contract` keeps all tracks on the same key/tempo/form/chord map.
+  - `track_role` defines register and density to avoid clashes.
+  - `relation_to_reference` enforces interaction with an existing track.
+  - `rhythm_phrase_rules` aligns phrase boundaries across tracks.
+- Keep `instruction` as a short human-readable summary; the backend will render the final musician prompt from `instruction_spec`.
 
 **CRITICAL: Refinement Mode and Style Preservation:**
 
